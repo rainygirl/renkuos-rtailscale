@@ -1,0 +1,44 @@
+Pass snooze()'s 64-bit argument correctly in osyield, fixing the startup hang.
+
+snooze() takes a bigtime_t (int64) of microseconds. Under the 32-bit cdecl
+ABI that is two stack words, but osyield called it through sysvicall1, which
+pushes a single word. The high half of the argument was therefore whatever
+the stack happened to contain: when it was non-zero, this yield slept for
+(garbage << 32) microseconds, which is indistinguishable from forever.
+
+lock2 calls osyield() during its spin phase while holding m.locks and a P,
+so the thread froze inside libc still holding the P. Nothing else could be
+scheduled: runnable goroutines sat queued, idle Ms sat unused, and the CPU
+was idle because the thread really was asleep. It looked random because it
+depended on stack garbage, and it was rare at GOMAXPROCS=1 because with
+little contention lock2 seldom reaches the spin phase. The asm osyield1
+already pushed a proper 64-bit zero, which is why only this path broke.
+
+Measured with haiku32/testdata/stress/lockstress.go, alternating builds
+run-for-run: 0 hangs in 20 with this fix, 12 in 20 without. tailscaled's
+LocalAPI then came up 6 times out of 6, each in 1s, where it used to wedge
+roughly one start in seven.
+
+--- a/src/runtime/os2_haiku.go
++++ b/src/runtime/os2_haiku.go
+@@ -651,7 +651,19 @@
+ 
+ //go:nosplit
+ func osyield() {
+-	sysvicall1(&libc_snooze, 0)
++	// snooze() takes a 64-bit bigtime_t. In the 32-bit cdecl ABI that is TWO
++	// stack words, so it must be passed with sysvicall2; sysvicall1 pushes only
++	// the low word and leaves the high word as whatever the stack happened to
++	// hold. When that garbage was non-zero, this "yield" slept for
++	// (garbage << 32) microseconds - effectively forever.
++	//
++	// That was the Haiku/386 startup hang. lock2 calls osyield() in its spin
++	// phase while holding m.locks and a P, so the m froze inside libc holding
++	// the P, with the CPU idle and idle Ms sitting unused, and nothing else
++	// could be scheduled. It looked random because it depended on stack
++	// garbage, and it was rare at GOMAXPROCS=1 because with little contention
++	// lock2 seldom reaches the spin phase.
++	sysvicall2(&libc_snooze, 0, 0)
+ }
+ 
+ func area_for(addr uintptr) {

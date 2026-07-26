@@ -1,0 +1,34 @@
+Create each m's parking semaphore when the m is created, not on its first lock2.
+
+semacreate calls libc malloc, and lock2 calls semacreate after taking m.locks
+and while holding a P, so the very first lock2 on a new m performs a libc
+allocation from inside a runtime critical section. mpreinit runs on the
+creating thread before the new m executes any Go code, where blocking is
+harmless.
+
+Measured with the lock/channel stress reproducer, alternating builds
+run-for-run: 6 hangs in 15 with this patch, 8 in 15 without - within noise at
+that sample size, so treat this as removing one unbounded libc call from a
+critical section rather than as a proven fix for the startup hang.
+
+--- a/src/runtime/os2_haiku.go
++++ b/src/runtime/os2_haiku.go
+@@ -230,6 +230,18 @@
+ func mpreinit(mp *m) {
+ 	mp.gsignal = malg(32 * 1024)
+ 	mp.gsignal.m = mp
++	// Create this m's parking semaphore here, on the thread creating the m,
++	// instead of leaving it to the m's first lock2.
++	//
++	// semacreate calls libc malloc, and lock2 calls semacreate after taking
++	// m.locks and while holding a P - a libc allocation inside a runtime
++	// critical section. mpreinit runs before the new m executes any Go code, so
++	// the allocation happens where blocking is harmless. Measured on hardware
++	// with the lock/channel stress reproducer, alternating builds run-for-run:
++	// 6 hangs in 15 with this, 8 in 15 without. Small and within noise at that
++	// sample size, so this is hygiene rather than a proven fix - but it removes
++	// one unbounded libc call from a critical section, which is worth having.
++	semacreate(mp)
+ }
+ 
+ func miniterrno()

@@ -1,0 +1,403 @@
+--- a/src/runtime/netpoll_haiku.go
++++ b/src/runtime/netpoll_haiku.go
+@@ -9,9 +9,27 @@ import (
+ 	"unsafe"
+ )
+ 
+-// This is based on the former libgo/runtime/netpoll_select.c implementation
+-// except that it uses poll instead of select and is written in Go.
+-// It's also based on Solaris implementation for the arming mechanisms
++// Haiku netpoller, built on poll(2).
++//
++// Design notes (this differs from the AIX/Solaris implementation it started
++// from, which was not reliable here):
++//
++//   - Every entry is identified by its FD, never by an index. The original code
++//     stored the pfds index in pd.user; netpollclose swap-removes entries, so an
++//     arm that raced a close could write its POLLIN into the slot of an
++//     unrelated fd. The armed fd then never got polled again: its Read/Accept
++//     hung forever AND its deadline never fired (the pollDesc was effectively
++//     detached from the poller). Storing the fd and looking entries up by fd
++//     makes arming immune to concurrent reordering.
++//
++//   - poll() runs on a private snapshot with both locks released, so an arm or
++//     close never blocks behind a poll in progress. Any mutation posts a wake
++//     byte; a wake that delivers nothing triggers one non-blocking re-poll of a
++//     fresh snapshot, which is where an arm that landed mid-poll is picked up.
++//
++//   - Results are matched back by fd against the live table, and additionally
++//     validated against the pollDesc's fdseq, so a recycled fd number can never
++//     deliver a stale event to a new pollDesc.
+ 
+ //go:cgo_import_dynamic libc_poll poll "libroot.so"
+ //go:linkname libc_poll libc_poll
+@@ -24,7 +42,7 @@ func poll(pfds *pollfd, npfds uintptr, timeout uintptr) (int32, int32) {
+ 	return int32(r), int32(err)
+ }
+ 
+-// pollfd represents the poll structure for AIX operating system.
++// pollfd represents the poll structure for the Haiku operating system.
+ type pollfd struct {
+ 	fd      int32
+ 	events  int16
+@@ -37,12 +55,33 @@ const _POLLHUP = 0x0080
+ const _POLLERR = 0x0004
+ 
+ var (
+-	pfds           []pollfd
+-	pds            []*pollDesc
+-	mtxpoll        mutex
+-	mtxset         mutex
+-	rdwake         int32
+-	wrwake         int32
++	// pfds[0] is always the wake pipe. pfds[i] and pds[i] correspond, but the
++	// pairing is only valid while mtxset is held; entries move on close, so all
++	// lookups go through findPollFDLocked (by fd), never through a saved index.
++	pfds []pollfd
++	pds  []*pollDesc
++
++	// blockPollSet is the buffer the ONE blocking poller snapshots into. Go
++	// guarantees a single blocking netpoll at a time (findRunnable swaps
++	// sched.lastpoll), so this has exactly one user; blockPollBusy is a
++	// belt-and-suspenders check in case that ever changes.
++	blockPollSet  []pollfd
++	blockPollBusy atomic.Uint32
++
++	// probePollSet is the equivalent buffer for opportunistic netpoll(0) probes
++	// (findRunnable and sysmon). They need one of their own: sharing the
++	// blocking poller's buffer overwrites the memory its poll() is writing
++	// revents into, which randomly loses readiness. Several Ms can probe at
++	// once, so probePollBusy really is contended; a probe that loses the CAS
++	// simply reports nothing, which is always safe.
++	probePollSet  []pollfd
++	probePollBusy atomic.Uint32
++
++	mtxpoll mutex
++	mtxset  mutex
++	rdwake  int32
++	wrwake  int32
++
+ 	pendingUpdates int32
+ 
+ 	netpollWakeSig uint32 // used to avoid duplicate calls of netpollBreak
+@@ -66,12 +105,27 @@ func netpollinit() {
+ 
+ 	pds = make([]*pollDesc, 1, 128)
+ 	pds[0] = nil
++
++	// Scratch buffer that poll() reads while the locks are released. Kept at
++	// least as long as pfds (grown in netpollopen) so netpoll never allocates.
++	blockPollSet = make([]pollfd, 1, 128)
++	probePollSet = make([]pollfd, 1, 128)
+ }
+ 
+ func netpollIsPollDescriptor(fd uintptr) bool {
+ 	return fd == uintptr(rdwake) || fd == uintptr(wrwake)
+ }
+ 
++// findPollFDLocked returns the current index of fd, or -1. mtxset must be held.
++func findPollFDLocked(fd int32) int {
++	for i := 1; i < len(pfds); i++ {
++		if pfds[i].fd == fd {
++			return i
++		}
++	}
++	return -1
++}
++
+ // netpollwakeup writes on wrwake to wakeup poll before any changes.
+ func netpollwakeup() {
+ 	if pendingUpdates == 0 {
+@@ -88,12 +142,20 @@ func netpollopen(fd uintptr, pd *pollDesc) int32 {
+ 	lock(&mtxset)
+ 	unlock(&mtxpoll)
+ 
+-	// We don't worry about pd.fdseq here,
+-	// as mtxset protects us from stale pollDescs.
+-
+-	pd.user = uint32(len(pfds))
++	// Store the FD (not an index) as the cookie: entries move when other fds
++	// are closed, so an index would go stale and arms would land on the wrong
++	// socket.
++	pd.user = uint32(fd)
+ 	pfds = append(pfds, pollfd{fd: int32(fd)})
+ 	pds = append(pds, pd)
++	// Keep the scratch snapshot buffers at least as long as pfds so netpoll can
++	// copy into them without allocating (netpoll must not allocate).
++	for len(blockPollSet) < len(pfds) {
++		blockPollSet = append(blockPollSet, pollfd{})
++	}
++	for len(probePollSet) < len(pfds) {
++		probePollSet = append(probePollSet, pollfd{})
++	}
+ 	unlock(&mtxset)
+ 	return 0
+ }
+@@ -105,16 +167,13 @@ func netpollclose(fd uintptr) int32 {
+ 	lock(&mtxset)
+ 	unlock(&mtxpoll)
+ 
+-	for i := 0; i < len(pfds); i++ {
+-		if pfds[i].fd == int32(fd) {
+-			pfds[i] = pfds[len(pfds)-1]
+-			pfds = pfds[:len(pfds)-1]
+-
+-			pds[i] = pds[len(pds)-1]
+-			pds[i].user = uint32(i)
+-			pds = pds[:len(pds)-1]
+-			break
+-		}
++	if i := findPollFDLocked(int32(fd)); i >= 0 {
++		last := len(pfds) - 1
++		pfds[i] = pfds[last]
++		pfds = pfds[:last]
++		pds[i] = pds[last]
++		pds = pds[:last]
++		// No index fixup needed: cookies are fds, not indices.
+ 	}
+ 	unlock(&mtxset)
+ 	return 0
+@@ -127,11 +186,15 @@ func netpollarm(pd *pollDesc, mode int) {
+ 	lock(&mtxset)
+ 	unlock(&mtxpoll)
+ 
+-	switch mode {
+-	case 'r':
+-		pfds[pd.user].events |= _POLLIN
+-	case 'w':
+-		pfds[pd.user].events |= _POLLOUT
++	// Look the entry up by fd. If it is gone (closed concurrently) there is
++	// nothing to arm; the closing side wakes any waiter.
++	if i := findPollFDLocked(int32(pd.user)); i >= 0 {
++		switch mode {
++		case 'r':
++			pfds[i].events |= _POLLIN
++		case 'w':
++			pfds[i].events |= _POLLOUT
++		}
+ 	}
+ 	unlock(&mtxset)
+ }
+@@ -149,14 +212,16 @@ func netpollBreak() {
+ // delay < 0: blocks indefinitely
+ // delay == 0: does not block, just polls
+ // delay > 0: block for up to that many nanoseconds
++//
+ //go:nowritebarrierrec
+ func netpoll(delay int64) (gList, int32) {
+ 	var timeout uintptr
+ 	if delay < 0 {
+ 		timeout = ^uintptr(0)
+ 	} else if delay == 0 {
+-		// TODO: call poll with timeout == 0
+-		return gList{}, 0
++		// Non-blocking poll. Needed so the scheduler's opportunistic netpoll(0)
++		// calls (findRunnable and sysmon) can actually discover readiness.
++		timeout = 0
+ 	} else if delay < 1e6 {
+ 		timeout = 1
+ 	} else if delay < 1e15 {
+@@ -166,61 +231,149 @@ func netpoll(delay int64) (gList, int32) {
+ 		// 1e9 ms == ~11.5 days.
+ 		timeout = 1e9
+ 	}
++
++	// NEVER hold mtxset across poll(), on ANY path. netpollarm/netpollopen/
++	// netpollclose all take mtxpoll then mtxset, and they run with other runtime
++	// locks already held, so a poll() under mtxset does not merely delay them -
++	// it deadlocks the scheduler. Observed as: P0 with schedtick=0 and a
++	// non-empty runq, one M holding two locks with no P, and the process frozen
++	// with the CPU idle before it had logged anything.
++	//
++	// So every caller snapshots the fd set into its own buffer, drops both
++	// locks, polls the snapshot, then re-takes mtxset and matches results back
++	// by fd. There is one buffer per kind of caller, claimed with a CAS:
++	//
++	//   - the blocking poller (delay != 0); Go runs at most one at a time
++	//   - opportunistic probes (delay == 0); several Ms can try at once
++	//
++	// One shared buffer would be a data race: a probe's snapshot overwrites the
++	// memory the blocking poller's in-flight poll() writes revents into.
++	var spfds []pollfd
++	blocking := delay != 0
++	if blocking && !blockPollBusy.CompareAndSwap(0, 1) {
++		// Should not happen; degrade to a probe rather than share the buffer.
++		blocking = false
++		timeout = 0
++	}
++	if blocking {
++		spfds = blockPollSet
++	} else {
++		if !probePollBusy.CompareAndSwap(0, 1) {
++			// Another probe is running. Reporting nothing is safe: probes are
++			// opportunistic, and the blocking poller still has the fd armed.
++			return gList{}, 0
++		}
++		spfds = probePollSet
++	}
++
++	var snapLen int
++	rescanned := false
+ retry:
+ 	lock(&mtxpoll)
+ 	lock(&mtxset)
+ 	pendingUpdates = 0
++	snapLen = len(pfds)
++	// The buffers are grown in netpollopen (netpoll runs with write barriers
++	// prohibited and cannot append here); if one somehow lags, poll what fits -
++	// entry 0 is the wake pipe, so progress continues.
++	if snapLen > len(spfds) {
++		snapLen = len(spfds)
++	}
++	copy(spfds[:snapLen], pfds[:snapLen])
++	unlock(&mtxset)
+ 	unlock(&mtxpoll)
+ 
+-	n, e := poll(&pfds[0], uintptr(len(pfds)), timeout)
++	n, e := poll(&spfds[0], uintptr(snapLen), timeout)
+ 	if n < 0 {
+ 		if e != _EINTR {
+-			println("errno=", e, " len(pfds)=", len(pfds))
++			println("errno=", e, " snapLen=", snapLen)
+ 			throw("poll failed")
+ 		}
+-		unlock(&mtxset)
+ 		// If a timed sleep was interrupted, just return to
+ 		// recalculate how long we should sleep now.
+ 		if timeout > 0 {
++			netpollReleaseBuf(blocking)
+ 			return gList{}, 0
+ 		}
+ 		goto retry
+ 	}
+-	// Check if some descriptors need to be changed
+-	if n != 0 && pfds[0].revents&(_POLLIN|_POLLHUP|_POLLERR) != 0 {
+-		if delay != 0 {
+-			// A netpollwakeup could be picked up by a
+-			// non-blocking poll. Only clear the wakeup
+-			// if blocking.
++
++	lock(&mtxset)
++	// Check if the wake pipe fired (an arm/close/break).
++	//
++	// Only drain it if we are the blocking poller, or if there is none. A probe
++	// that drains while a blocking poll() is parked on that pipe steals its
++	// wakeup: the byte is gone, so the parked poll() keeps waiting on a snapshot
++	// taken before the arm, and that fd never becomes ready again - the
++	// goroutine reading it then hangs forever with the CPU idle. A probe cannot
++	// stand in for the blocking poller either, because it never rescans.
++	wokeByPipe := false
++	if n != 0 && spfds[0].revents&(_POLLIN|_POLLHUP|_POLLERR) != 0 {
++		if blocking || blockPollBusy.Load() == 0 {
++			wokeByPipe = true
+ 			var b [1]byte
+ 			for read(rdwake, unsafe.Pointer(&b[0]), 1) == 1 {
+ 			}
+ 			atomic.Store(&netpollWakeSig, 0)
+ 		}
+-		// Still look at the other fds even if the mode may have
+-		// changed, as netpollBreak might have been called.
+ 		n--
+ 	}
+ 	var toRun gList
+ 	delta := int32(0)
+-	for i := 1; i < len(pfds) && n > 0; i++ {
+-		pfd := &pfds[i]
+-
++	// Scan every snapshot entry, not just until we have accounted for n ready
++	// fds. Using n as a countdown drops events: the wake-pipe entry consumes one
++	// count, and an entry whose fd has since been closed consumes another, so
++	// the loop could exit before reaching a later fd that poll() genuinely
++	// reported ready - its reader then never woke (a client hung waiting for a
++	// response the server had already written).
++	for i := 1; i < snapLen; i++ {
++		sp := &spfds[i]
+ 		var mode int32
+-		if pfd.revents&(_POLLIN|_POLLHUP|_POLLERR) != 0 {
++		if sp.revents&(_POLLIN|_POLLHUP|_POLLERR) != 0 {
+ 			mode += 'r'
+-			pfd.events &= ^_POLLIN
+ 		}
+-		if pfd.revents&(_POLLOUT|_POLLHUP|_POLLERR) != 0 {
++		if sp.revents&(_POLLOUT|_POLLHUP|_POLLERR) != 0 {
+ 			mode += 'w'
+-			pfd.events &= ^_POLLOUT
+ 		}
+-		if mode != 0 {
+-			pds[i].setEventErr(pfd.revents == _POLLERR, 0)
+-			delta += netpollready(&toRun, pds[i], mode)
+-			n--
++		if mode == 0 {
++			continue
++		}
++		// Match by fd against the live table: entries may have moved (or the fd
++		// may have been closed) while we polled the snapshot.
++		j := findPollFDLocked(sp.fd)
++		if j < 0 {
++			continue
+ 		}
++		// Clear only the bits this delivery satisfies, leaving any arm that
++		// arrived while we were polling intact.
++		if mode == 'r' || mode == 'r'+'w' {
++			pfds[j].events &^= _POLLIN
++		}
++		if mode == 'w' || mode == 'r'+'w' {
++			pfds[j].events &^= _POLLOUT
++		}
++		pds[j].setEventErr(sp.revents == _POLLERR, 0)
++		delta += netpollready(&toRun, pds[j], mode)
++	}
++	// If the wake pipe fired and we delivered nothing, an arm/close/break landed
++	// after we snapshotted, so its event is not in this poll's result.
++	// Re-snapshot and poll once, non-blocking, to pick it up.
++	if toRun.empty() && wokeByPipe && !rescanned && delay != 0 {
++		rescanned = true
++		timeout = 0
++		unlock(&mtxset)
++		goto retry
+ 	}
+ 	unlock(&mtxset)
++	netpollReleaseBuf(blocking)
+ 	return toRun, delta
+ }
++
++// netpollReleaseBuf releases the snapshot buffer claimed at the top of netpoll.
++func netpollReleaseBuf(blocking bool) {
++	if blocking {
++		blockPollBusy.Store(0)
++	} else {
++		probePollBusy.Store(0)
++	}
++}
+--- a/src/runtime/os2_haiku.go
++++ b/src/runtime/os2_haiku.go
+@@ -366,14 +366,26 @@
+ 		ts.set_sec(sec)
+ 		ts.set_nsec(nsec)
+ 
+-		if r, err := sem_timedwait((*semt)(unsafe.Pointer(mp.waitsema)), &ts); r != 0 {
+-			if err == _ETIMEDOUT || err == _EAGAIN || err == _EINTR {
++		for {
++			r, err := sem_timedwait((*semt)(unsafe.Pointer(mp.waitsema)), &ts)
++			if r == 0 {
++				return 0
++			}
++			if err == _EINTR {
++				// A signal (notably SIGURG from async preemption, which now
++				// actually fires on this port) interrupted the wait. The
++				// deadline in ts is absolute, so simply retry: reporting this as
++				// a timeout would make the caller treat a not-yet-posted
++				// semaphore as expired and drop the pending wakeup, which showed
++				// up as a goroutine/timer that never resumed.
++				continue
++			}
++			if err == _ETIMEDOUT || err == _EAGAIN {
+ 				return -1
+ 			}
+ 			println("sem_timedwait err ", err, " ts.tv_sec ", ts.tv_sec, " ts.tv_nsec ", ts.tv_nsec, " ns ", ns, " id ", mp.id)
+ 			throw("sem_timedwait")
+ 		}
+-		return 0
+ 	}
+ 	for {
+ 		r1, err := sem_wait((*semt)(unsafe.Pointer(mp.waitsema)))

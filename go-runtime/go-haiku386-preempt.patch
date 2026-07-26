@@ -1,0 +1,52 @@
+--- a/src/runtime/sys_haiku_386.s
++++ b/src/runtime/sys_haiku_386.s
+@@ -146,13 +146,31 @@
+ 	RET
+ 
+ // Haiku invokes SA_SIGINFO handlers using the cdecl ABI.
+-TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$12
++TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$24
+ 	NOP	SP
+-	MOVL	16(SP), AX
++	// Haiku's signal wrapper is cdecl and expects the handler to preserve the
++	// callee-saved registers DI/SI/BX. It holds the pointer to the inline vregs
++	// copy in DI (and the frame data in SI) ACROSS the handler call, and after
++	// the handler returns it copies those (possibly asyncPreempt-modified) vregs
++	// back into the kernel signal context. If we clobber DI here, the copy-back
++	// reads garbage and the injected preemption (or any register change) is
++	// lost. Save/restore DI/SI/BX around the Go handler.
++	MOVL	DI, 12(SP)
++	MOVL	SI, 16(SP)
++	MOVL	BX, 20(SP)
++	// With a $24 frame the incoming args (return addr at 24(SP)) are at
++	// 28/32/36(SP): sig, user_data, and the INLINE vregs (== mcontext). Haiku
++	// places the register set inline on the stack here, not a pointer to it, so
++	// pass its ADDRESS as the context; sigctxt.regs() then reads the real
++	// eip/esp instead of the eip value as a bogus pointer.
++	MOVL	28(SP), AX
+ 	MOVL	AX, 0(SP)
+-	MOVL	20(SP), AX
++	MOVL	32(SP), AX
+ 	MOVL	AX, 4(SP)
+-	MOVL	24(SP), AX
++	LEAL	36(SP), AX
+ 	MOVL	AX, 8(SP)
+ 	CALL	runtime·sigtrampgo(SB)
++	MOVL	12(SP), DI
++	MOVL	16(SP), SI
++	MOVL	20(SP), BX
+ 	RET
+--- a/src/runtime/signal_haiku_386.go
++++ b/src/runtime/signal_haiku_386.go
+@@ -10,7 +10,10 @@
+ 
+ //go:nosplit
+ //go:nowritebarrierrec
+-func (c *sigctxt) regs() *mcontext { return &(*ucontext)(c.ctxt).uc_mcontext }
++// c.ctxt is the address of the inline vregs (== mcontext) that Haiku's signal
++// wrapper places on the stack; see sigtramp in sys_haiku_386.s. It is NOT a
++// ucontext, so cast it directly rather than adding the uc_mcontext offset.
++func (c *sigctxt) regs() *mcontext { return (*mcontext)(c.ctxt) }
+ func (c *sigctxt) eax() uint32 { return c.regs().eax }
+ func (c *sigctxt) ebx() uint32 { return c.regs().ebx }
+ func (c *sigctxt) ecx() uint32 { return c.regs().ecx }

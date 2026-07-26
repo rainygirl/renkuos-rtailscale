@@ -1,0 +1,2669 @@
+diff --git a/Makefile b/Makefile
+index fbe7124..ca2af46 100644
+--- a/Makefile
++++ b/Makefile
+@@ -8,7 +8,7 @@ TAGS ?= "latest"
+ # target machine.
+ DIST386 ?= dist/linux-386
+ 
+-.PHONY: all build386-dist verify386 run386 haiku32 run-haiku32
++.PHONY: all build386-dist prepare386-dist verify386 run386 haiku32 run-haiku32
+ all: verify386 ## Build the linux/386 Tailscale client
+ 
+ build386-dist: ## Build stripped, static linux/386 binaries in $(DIST386)
+@@ -18,7 +18,9 @@ build386-dist: ## Build stripped, static linux/386 binaries in $(DIST386)
+ 	CGO_ENABLED=0 GOOS=linux GOARCH=386 TS_USE_TOOLCHAIN=1 \
+ 		./build_dist.sh --strip -o "$(DIST386)/tailscale" ./cmd/tailscale
+ 
+-verify386: build386-dist ## Verify that the distribution binaries are static 32-bit x86 ELF files
++prepare386-dist: build386-dist
++
++verify386: prepare386-dist ## Verify that the distribution binaries are static 32-bit x86 ELF files
+ 	@file "$(DIST386)/tailscale" "$(DIST386)/tailscaled"
+ 	@file "$(DIST386)/tailscale" | grep -Eq 'ELF 32-bit.*(Intel 80386|i386).*statically linked' || \
+ 		{ echo "error: $(DIST386)/tailscale is not a static linux/386 binary" >&2; exit 1; }
+@@ -32,11 +34,15 @@ run386: verify386 ## Run tailscaled in unprivileged userspace-networking mode (o
+ 	fi
+ 	"$(DIST386)/tailscaled" --tun=userspace-networking --state=mem:
+ 
+-haiku32: verify386 ## Build the 32-bit Haiku Tailscale proxy appliance
+-	./haiku32/build.sh "$(DIST386)" "dist/haiku32"
++haiku32: ## Cross-build native Tailscale binaries for 32-bit Haiku
++	./haiku32/build.sh "dist/haiku32"
+ 
+-run-haiku32: haiku32 ## Run the Haiku-compatible appliance on a host with qemu-system-i386
+-	TS_IMAGE_DIR=dist/haiku32 "dist/haiku32/tailscale-haiku"
++run-haiku32: haiku32 ## Run the native userspace-networking client on Haiku/x86
++	@if [ "$$(uname -s)" != Haiku ]; then \
++		echo "error: copy dist/haiku32 to a 32-bit Haiku system to run it" >&2; \
++		exit 1; \
++	fi
++	"dist/haiku32/tailscale-haiku"
+ 
+ PLATFORM ?= "flyio" ## flyio==linux/amd64. Set to "" to build all platforms.
+ 
+diff --git a/build_dist.sh b/build_dist.sh
+index a32fe41..6653e26 100755
+--- a/build_dist.sh
++++ b/build_dist.sh
+@@ -16,7 +16,8 @@ if [ -n "${TS_USE_TOOLCHAIN:-}" ]; then
+ 	go="./tool/go"
+ fi
+ 
+-eval `CGO_ENABLED=0 GOOS=$($go env GOHOSTOS) GOARCH=$($go env GOHOSTARCH) $go run ./cmd/mkversion`
++version_vars=$(CGO_ENABLED=0 GOOS=$($go env GOHOSTOS) GOARCH=$($go env GOHOSTARCH) "$go" run ./cmd/mkversion)
++eval "$version_vars"
+ 
+ if [ "$#" -ge 1 ] && [ "$1" = "shellvars" ]; then
+ 	cat <<EOF
+diff --git a/client/local/dial_haiku.go b/client/local/dial_haiku.go
+new file mode 100644
+index 0000000..87f552f
+--- /dev/null
++++ b/client/local/dial_haiku.go
+@@ -0,0 +1,74 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package local
++
++import (
++	"bufio"
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/netip"
++	"strconv"
++
++	"tailscale.com/net/netutil"
++)
++
++// haikuUserDial performs the LocalAPI upgrade without net/http.Transport.
++// Haiku/386's non-blocking socket compatibility wrapper is reliable for raw
++// HTTP I/O, but the standard Transport's 101 body wrapper can turn an
++// EAGAIN while waiting for the upgraded peer into EOF and close ProxyCommand.
++func (lc *Client) haikuUserDial(ctx context.Context, network, host string, port uint16) (net.Conn, bool, error) {
++	c, err := lc.defaultDialer(ctx, network, "local-tailscaled.sock:80")
++	if err != nil {
++		return nil, true, err
++	}
++	closeConn := func() { _ = c.Close() }
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://local-tailscaled.sock/localapi/v0/dial", nil)
++	if err != nil {
++		closeConn()
++		return nil, true, err
++	}
++	req.Header.Set("Upgrade", "ts-dial")
++	req.Header.Set("Connection", "upgrade")
++	req.Header.Set("Dial-Host", host)
++	req.Header.Set("Dial-Port", strconv.Itoa(int(port)))
++	req.Header.Set("Dial-Network", network)
++	if err := req.Write(c); err != nil {
++		closeConn()
++		return nil, true, err
++	}
++	br := bufio.NewReader(c)
++	res, err := http.ReadResponse(br, req)
++	if err != nil {
++		closeConn()
++		return nil, true, err
++	}
++	if res.StatusCode == http.StatusOK && res.Header.Get("Dial-Self") == "true" {
++		addr := res.Header.Get("Dial-Addr")
++		res.Body.Close()
++		closeConn()
++		if addr == "" {
++			return nil, true, fmt.Errorf("server returned Dial-Self without Dial-Addr")
++		}
++		if _, err := netip.ParseAddrPort(addr); err != nil {
++			return nil, true, fmt.Errorf("invalid Dial-Addr %q: %v", addr, err)
++		}
++		var d net.Dialer
++		out, err := d.DialContext(ctx, network, addr)
++		return out, true, err
++	}
++	if res.StatusCode != http.StatusSwitchingProtocols {
++		body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
++		res.Body.Close()
++		closeConn()
++		return nil, true, fmt.Errorf("unexpected LocalAPI dial response: %s, %s", res.Status, body)
++	}
++	// br may already contain bytes sent immediately after the 101 response.
++	// Keep those bytes in front of the raw upgraded connection.
++	return netutil.NewDrainBufConn(c, br), true, nil
++}
+diff --git a/client/local/dial_other.go b/client/local/dial_other.go
+new file mode 100644
+index 0000000..df50821
+--- /dev/null
++++ b/client/local/dial_other.go
+@@ -0,0 +1,15 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !haiku
++
++package local
++
++import (
++	"context"
++	"net"
++)
++
++func (lc *Client) haikuUserDial(context.Context, string, string, uint16) (net.Conn, bool, error) {
++	return nil, false, nil
++}
+diff --git a/client/local/local.go b/client/local/local.go
+index e26ee3c..937252b 100644
+--- a/client/local/local.go
++++ b/client/local/local.go
+@@ -120,10 +120,18 @@ func (lc *Client) defaultDialer(ctx context.Context, network, addr string) (net.
+ 		if port, _, err := safesocket.LocalTCPPortAndToken(); err == nil {
+ 			// We use 127.0.0.1 and not "localhost" (issue 7851).
+ 			var d net.Dialer
+-			return d.DialContext(ctx, "tcp", "127.0.0.1:"+strconv.Itoa(port))
++			c, err := d.DialContext(ctx, "tcp", "127.0.0.1:"+strconv.Itoa(port))
++			if err != nil {
++				return nil, err
++			}
++			return wrapHaikuNonblocking(c)
+ 		}
+ 	}
+-	return safesocket.ConnectContext(ctx, lc.socket())
++	c, err := safesocket.ConnectContext(ctx, lc.socket())
++	if err != nil {
++		return nil, err
++	}
++	return wrapHaikuNonblocking(c)
+ }
+ 
+ // DoLocalRequest makes an HTTP request to the local machine's Tailscale daemon.
+@@ -138,10 +146,29 @@ func (lc *Client) defaultDialer(ctx context.Context, network, addr string) (net.
+ func (lc *Client) DoLocalRequest(req *http.Request) (*http.Response, error) {
+ 	req.Header.Set("Tailscale-Cap", strconv.Itoa(int(tailcfg.CurrentCapabilityVersion)))
+ 	lc.tsClientOnce.Do(func() {
++		tr := &http.Transport{DialContext: lc.dialer()}
++		if runtime.GOOS == "haiku" {
++			// Fail fast instead of hanging. The Haiku netpoller can lose a
++			// socket's read re-arm, and a CLI process that hits that would wait
++			// forever with no error - `tailscale nc` (the ssh ProxyCommand)
++			// would never reach its dial, and ssh would sit there until its own
++			// timeout. A response-header deadline turns that into a normal
++			// error so the caller (or an ssh wrapper's retry loop) can start
++			// a fresh attempt, which succeeds. This only bounds the wait for
++			// response HEADERS, so streaming endpoints (watch-ipn-bus, the
++			// dial tunnel) keep working once they have started.
++			tr.ResponseHeaderTimeout = 10 * time.Second
++			// Don't reuse LocalAPI connections on Haiku/386. The netpoller can
++			// lose the read re-arm on an idle-then-reused unix socket, and the
++			// request then hangs with no error: the CLI's first call (status)
++			// succeeds, the next one on the same pooled connection never gets a
++			// response. Measured with an isolated unix-socket HTTP test:
++			// keep-alive on 2/5 vs off 4/5. A fresh connection per LocalAPI call
++			// is cheap here and makes `tailscale nc`/`status` reliable.
++			tr.DisableKeepAlives = true
++		}
+ 		lc.tsClient = &http.Client{
+-			Transport: cmp.Or(lc.Transport, http.RoundTripper(
+-				&http.Transport{DialContext: lc.dialer()}),
+-			),
++			Transport: cmp.Or(lc.Transport, http.RoundTripper(tr)),
+ 		}
+ 	})
+ 	if !lc.OmitAuth {
+@@ -149,9 +176,89 @@ func (lc *Client) DoLocalRequest(req *http.Request) (*http.Response, error) {
+ 			req.SetBasicAuth("", token)
+ 		}
+ 	}
++	if runtime.GOOS == "haiku" && !envknob.Bool("TS_HAIKU_NO_LOCALAPI_WORKAROUNDS") {
++		// Still needed with sockets on the netpoller: Haiku's poll() does not
++		// report read readiness for unix-domain sockets, so a LocalAPI request
++		// can stall even though the daemon is healthy.
++		return lc.doHaikuWithRetry(req)
++	}
+ 	return lc.tsClient.Do(req)
+ }
+ 
++// doHaikuWithRetry retries a LocalAPI request whose response headers timed out.
++//
++// On Haiku/386 the netpoller occasionally loses a socket's read wakeup, so an
++// individual request can stall even though the daemon is healthy - the very next
++// request on a fresh connection succeeds. ResponseHeaderTimeout turns the stall
++// into an error; retrying here means a single unlucky request no longer fails a
++// whole command (`tailscale up` was giving up at whichever call happened to be
++// hit: status, then check-prefs). Only retried when the request is safely
++// replayable: no body, or a body with GetBody (which net/http provides for the
++// byte-buffer bodies the LocalAPI client uses; anything else is buffered here
++// so it becomes replayable too).
++func (lc *Client) doHaikuWithRetry(req *http.Request) (*http.Response, error) {
++	if req.Body != nil && req.GetBody == nil {
++		// Make the request replayable. LocalAPI bodies are small (prefs, JSON
++		// commands), so buffering costs nothing. Without this the retry could
++		// not clone the request and the whole call failed with "cannot retry
++		// request without GetBody" - which is exactly what `tailscale up` hit
++		// on /localapi/v0/start, i.e. the retry turned a recoverable stall into
++		// a hard failure on the one request that matters most.
++		body, err := io.ReadAll(req.Body)
++		req.Body.Close()
++		if err != nil {
++			return nil, err
++		}
++		req.Body = io.NopCloser(bytes.NewReader(body))
++		req.ContentLength = int64(len(body))
++		req.GetBody = func() (io.ReadCloser, error) {
++			return io.NopCloser(bytes.NewReader(body)), nil
++		}
++	}
++	const attempts = 4
++	for i := 0; ; i++ {
++		r := req
++		if i > 0 {
++			var err error
++			r, err = haikuCloneRequest(req)
++			if err != nil {
++				// Not replayable after all: return the stall as-is rather than
++				// masking it with a clone error.
++				return nil, err
++			}
++		}
++		res, err := lc.tsClient.Do(r)
++		if err == nil || i == attempts-1 || !haikuRetryableErr(err) {
++			return res, err
++		}
++	}
++}
++
++func haikuRetryableErr(err error) bool {
++	if err == nil {
++		return false
++	}
++	// net/http reports the header deadline as this exact string; it is not an
++	// exported error value.
++	return strings.Contains(err.Error(), "timeout awaiting response headers")
++}
++
++func haikuCloneRequest(req *http.Request) (*http.Request, error) {
++	r2 := req.Clone(req.Context())
++	if req.Body == nil {
++		return r2, nil
++	}
++	if req.GetBody == nil {
++		return nil, fmt.Errorf("cannot retry request without GetBody")
++	}
++	body, err := req.GetBody()
++	if err != nil {
++		return nil, err
++	}
++	r2.Body = body
++	return r2, nil
++}
++
+ func (lc *Client) doLocalRequestNiceError(req *http.Request) (*http.Response, error) {
+ 	res, err := lc.DoLocalRequest(req)
+ 	if err == nil {
+@@ -995,6 +1102,9 @@ func (lc *Client) DialTCP(ctx context.Context, host string, port uint16) (net.Co
+ // The ctx is only used for the duration of the call, not the lifetime of the
+ // [net.Conn].
+ func (lc *Client) UserDial(ctx context.Context, network, host string, port uint16) (net.Conn, error) {
++	if c, handled, err := lc.haikuUserDial(ctx, network, host, port); handled {
++		return c, err
++	}
+ 	connCh := make(chan net.Conn, 1)
+ 	trace := httptrace.ClientTrace{
+ 		GotConn: func(info httptrace.GotConnInfo) {
+diff --git a/client/local/nonblock_haiku.go b/client/local/nonblock_haiku.go
+new file mode 100644
+index 0000000..719019c
+--- /dev/null
++++ b/client/local/nonblock_haiku.go
+@@ -0,0 +1,29 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package local
++
++import "net"
++
++// wrapHaikuNonblocking is a no-op, and three separate attempts to make it
++// something else have all made the Haiku/386 build worse. Do not try a fourth
++// without a new idea.
++//
++//  1. An EAGAIN retry loop that also forced the fd non-blocking: raced the
++//     poller and stalled `tailscale status` about half the time.
++//  2. A blocking dup via net.FileConn: came back non-blocking but unregistered
++//     with the poller, so reads surfaced raw "operation would block" errors to
++//     net/http.
++//  3. A deadline re-arm wrapper around Read and Write, mirroring the daemon's
++//     haikuAPIConn (which does help on the daemon's accepted connections).
++//     Here it stopped requests reaching the daemon at all: zero `localapi:`
++//     lines in the daemon log, so every command hung and `up` never reached
++//     Running. The client conn is driven by net/http's own read and write
++//     loops, which manage deadlines themselves; a second layer doing the same
++//     thing fights them.
++//
++// The client-side protection that does work lives above the connection, in
++// DoLocalRequest's retry (see doHaikuWithRetry).
++func wrapHaikuNonblocking(c net.Conn) (net.Conn, error) { return c, nil }
+diff --git a/client/local/nonblock_other.go b/client/local/nonblock_other.go
+new file mode 100644
+index 0000000..4568e9b
+--- /dev/null
++++ b/client/local/nonblock_other.go
+@@ -0,0 +1,10 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !haiku
++
++package local
++
++import "net"
++
++func wrapHaikuNonblocking(c net.Conn) (net.Conn, error) { return c, nil }
+diff --git a/cmd/tailscale/cli/nc.go b/cmd/tailscale/cli/nc.go
+index 34490ec..080769b 100644
+--- a/cmd/tailscale/cli/nc.go
++++ b/cmd/tailscale/cli/nc.go
+@@ -8,12 +8,17 @@
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"net"
+ 	"os"
++	"runtime"
+ 	"strconv"
+ 	"strings"
++	"syscall"
++	"time"
+ 
+ 	"github.com/peterbourgon/ff/v3/ffcli"
+ 	"tailscale.com/cmd/tailscale/cli/ffcomplete"
++	"tailscale.com/envknob"
+ )
+ 
+ var ncCmd = &ffcli.Command{
+@@ -45,7 +50,13 @@ func completeHostOrIP(arg string) ([]string, ffcomplete.ShellCompDirective, erro
+ }
+ 
+ func runNC(ctx context.Context, args []string) error {
+-	st, err := localClient.Status(ctx)
++	// Only the run state is needed here, not the peer list. On Haiku/386 that
++	// matters: the full Status response is large enough to need several reads,
++	// and the netpoller can lose the read re-arm partway through, leaving this
++	// call hung forever with no error - `tailscale nc` (the ssh ProxyCommand)
++	// then never even gets to its dial. StatusWithoutPeers is a small response
++	// and returns reliably.
++	st, err := localClient.StatusWithoutPeers(ctx)
+ 	if err != nil {
+ 		return fixTailscaledConnectError(err)
+ 	}
+@@ -71,6 +82,14 @@ func runNC(ctx context.Context, args []string) error {
+ 		return fmt.Errorf("Dial(%q, %v): %w", hostOrIP, port, err)
+ 	}
+ 	defer c.Close()
++	if runtime.GOOS == "haiku" && envknob.Bool("TS_HAIKU_NC_LEGACY") {
++		// Legacy busy-poll copy loop for the old blocking-socket build. The
++		// netpoll/preempt patches make blocking Read/Write park properly, so the
++		// standard io.Copy path below is used by default; its goroutines block in
++		// netpoll instead of spinning on runtime.Gosched (which pegged a core and
++		// made repeated `tailscale nc` runs spike CPU).
++		return runNCHaiku(c)
++	}
+ 	errc := make(chan error, 1)
+ 	go func() {
+ 		_, err := io.Copy(os.Stdout, c)
+@@ -82,3 +101,102 @@ func runNC(ctx context.Context, args []string) error {
+ 	}()
+ 	return <-errc
+ }
++
++// runNCHaiku uses an explicit copy loop instead of io.Copy. The Haiku/386 Go
++// port has no network poller, and io.Copy's file/connection fast paths can
++// leave the ProxyCommand process blocked after forwarding only the first byte
++// of an SSH identification string.
++func runNCHaiku(c net.Conn) error {
++	restorePipes, err := prepareNCHaikuPipes()
++	if err != nil {
++		return fmt.Errorf("preparing Haiku ProxyCommand pipes: %w", err)
++	}
++	defer restorePipes()
++
++	errc := make(chan error, 2)
++	go func() {
++		errc <- copyNCHaiku(os.Stdout, c, "peer-to-stdout")
++	}()
++
++	// Let the server-to-stdout pump enter its Read before starting the stdin
++	// pump. SSH waits for the server identification before sending the rest of
++	// its own identification, so this ordering avoids a two-sided startup
++	// stall on the single-core Haiku/386 scheduler.
++	runtime.Gosched()
++
++	go func() {
++		errc <- copyNCHaiku(c, os.Stdin, "stdin-to-peer")
++	}()
++	return <-errc
++}
++
++func copyNCHaiku(dst io.Writer, src io.Reader, direction string) error {
++	buf := make([]byte, 4<<10)
++	firstRead := true
++	firstWrite := true
++	fmt.Fprintf(os.Stderr, "tailscale nc (Haiku): %s pump entered\n", direction)
++	for {
++		nr, readErr := src.Read(buf)
++		if nr > 0 {
++			if firstRead {
++				firstRead = false
++				fmt.Fprintf(os.Stderr, "tailscale nc (Haiku): %s received first %d bytes\n", direction, nr)
++			}
++			for off := 0; off < nr; {
++				nw, writeErr := dst.Write(buf[off:nr])
++				if nw > 0 {
++					off += nw
++					if firstWrite {
++						firstWrite = false
++						fmt.Fprintf(os.Stderr, "tailscale nc (Haiku): %s forwarded first %d bytes\n", direction, nw)
++					}
++				}
++				if writeErr != nil {
++					if retryNCHaikuIO(writeErr) {
++						time.Sleep(2 * time.Millisecond)
++						continue
++					}
++					return writeErr
++				}
++				if nw == 0 {
++					return io.ErrNoProgress
++				}
++				runtime.Gosched()
++			}
++		}
++		if readErr != nil {
++			if retryNCHaikuIO(readErr) {
++				time.Sleep(2 * time.Millisecond)
++				continue
++			}
++			if errors.Is(readErr, io.EOF) {
++				return nil
++			}
++			return readErr
++		}
++		runtime.Gosched()
++	}
++}
++
++func retryNCHaikuIO(err error) bool {
++	if err == nil {
++		return false
++	}
++	if ne, ok := err.(net.Error); ok && (ne.Timeout() || ne.Temporary()) {
++		return true
++	}
++	type temporary interface {
++		Temporary() bool
++	}
++	if te, ok := err.(temporary); ok && te.Temporary() {
++		return true
++	}
++	// Non-blocking pipe/socket I/O (the ProxyCommand stdin/stdout pipes and the
++	// Haiku sockets) surfaces EAGAIN/EWOULDBLOCK when no data or space is
++	// momentarily available. On Haiku these arrive wrapped in *os.PathError /
++	// *os.SyscallError, which implement neither net.Error nor Temporary(), so
++	// the type assertions above miss them. Match the errno directly and retry;
++	// otherwise a transient "operation would block" tears down the connection
++	// mid-transfer (e.g. right after ssh's first 22-byte identification).
++	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)
++}
+diff --git a/cmd/tailscale/cli/nc_nonblock_haiku.go b/cmd/tailscale/cli/nc_nonblock_haiku.go
+new file mode 100644
+index 0000000..4302185
+--- /dev/null
++++ b/cmd/tailscale/cli/nc_nonblock_haiku.go
+@@ -0,0 +1,41 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package cli
++
++import (
++	"fmt"
++	"os"
++	"syscall"
++)
++
++// prepareNCHaikuPipes makes only pipe-backed stdin/stdout non-blocking. This
++// is the ProxyCommand case. A terminal is deliberately left unchanged because
++// O_NONBLOCK belongs to the shared open file description and could otherwise
++// affect the invoking shell.
++func prepareNCHaikuPipes() (func(), error) {
++	var changed []*os.File
++	for _, f := range []*os.File{os.Stdin, os.Stdout} {
++		fi, err := f.Stat()
++		if err != nil {
++			return func() {}, err
++		}
++		if fi.Mode()&os.ModeNamedPipe == 0 {
++			continue
++		}
++		if err := syscall.SetNonblock(int(f.Fd()), true); err != nil {
++			for _, old := range changed {
++				_ = syscall.SetNonblock(int(old.Fd()), false)
++			}
++			return func() {}, fmt.Errorf("fd %d: %w", f.Fd(), err)
++		}
++		changed = append(changed, f)
++	}
++	return func() {
++		for _, f := range changed {
++			_ = syscall.SetNonblock(int(f.Fd()), false)
++		}
++	}, nil
++}
+diff --git a/cmd/tailscale/cli/nc_nonblock_other.go b/cmd/tailscale/cli/nc_nonblock_other.go
+new file mode 100644
+index 0000000..484d1a0
+--- /dev/null
++++ b/cmd/tailscale/cli/nc_nonblock_other.go
+@@ -0,0 +1,8 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !haiku
++
++package cli
++
++func prepareNCHaikuPipes() (func(), error) { return func() {}, nil }
+diff --git a/cmd/tailscale/cli/ssh_getsid_linux.go b/cmd/tailscale/cli/ssh_getsid_linux.go
+new file mode 100644
+index 0000000..0d50cae
+--- /dev/null
++++ b/cmd/tailscale/cli/ssh_getsid_linux.go
+@@ -0,0 +1,10 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build linux
++
++package cli
++
++import "golang.org/x/sys/unix"
++
++func getSessionID(pid int) (int, error) { return unix.Getsid(pid) }
+diff --git a/cmd/tailscale/cli/ssh_getsid_other.go b/cmd/tailscale/cli/ssh_getsid_other.go
+new file mode 100644
+index 0000000..3419ab1
+--- /dev/null
++++ b/cmd/tailscale/cli/ssh_getsid_other.go
+@@ -0,0 +1,10 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !linux
++
++package cli
++
++import "errors"
++
++func getSessionID(int) (int, error) { return 0, errors.New("session IDs are unsupported") }
+diff --git a/cmd/tailscale/cli/ssh_unix.go b/cmd/tailscale/cli/ssh_unix.go
+index 1cc3ccb..8b07593 100644
+--- a/cmd/tailscale/cli/ssh_unix.go
++++ b/cmd/tailscale/cli/ssh_unix.go
+@@ -11,8 +11,6 @@
+ 	"path/filepath"
+ 	"runtime"
+ 	"strconv"
+-
+-	"golang.org/x/sys/unix"
+ )
+ 
+ func init() {
+@@ -30,7 +28,7 @@ func init() {
+ 		// SID is the session ID of the user's login session.
+ 		// It is also the process ID of the original shell that the user logged in with.
+ 		// We only need to check the environment of that process.
+-		sid, err := unix.Getsid(os.Getpid())
++		sid, err := getSessionID(os.Getpid())
+ 		if err != nil {
+ 			return ""
+ 		}
+diff --git a/cmd/tailscale/cli/up.go b/cmd/tailscale/cli/up.go
+index 428badc..c8796c9 100644
+--- a/cmd/tailscale/cli/up.go
++++ b/cmd/tailscale/cli/up.go
+@@ -506,7 +506,19 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
+ 		}
+ 	}
+ 
+-	st, err := localClient.Status(ctx)
++	var st *ipnstate.Status
++	var err error
++	if runtime.GOOS == "haiku" {
++		// Ask for the small response. The full Status carries the peer list,
++		// which takes several reads to receive, and on Haiku/386 the netpoller
++		// can lose a read wakeup partway through - `tailscale up` would then sit
++		// there until it timed out, never starting the backend. The only thing
++		// lost is the peer lookup in exitNodeIP, which merely decorates an
++		// "exit node changed" warning with an IP.
++		st, err = localClient.StatusWithoutPeers(ctx)
++	} else {
++		st, err = localClient.Status(ctx)
++	}
+ 	if err != nil {
+ 		return fixTailscaledConnectError(err)
+ 	}
+@@ -577,7 +589,11 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
+ 	}
+ 
+ 	defer func() {
+-		if retErr == nil {
++		// On Haiku/386 the daemon uses blocking sockets without a netpoller.
++		// Once the IPN watcher has reported Running, avoid opening one more
++		// LocalAPI connection merely to print optional health warnings; that
++		// extra accept can strand an otherwise successful startup.
++		if retErr == nil && runtime.GOOS != "haiku" {
+ 			checkUpWarnings(ctx)
+ 		}
+ 	}()
+diff --git a/cmd/tailscaled/netstack.go b/cmd/tailscaled/netstack.go
+index 4e180d3..3cb09be 100644
+--- a/cmd/tailscaled/netstack.go
++++ b/cmd/tailscaled/netstack.go
+@@ -10,6 +10,7 @@
+ 	"expvar"
+ 	"net"
+ 	"net/netip"
++	"runtime"
+ 
+ 	"tailscale.com/tsd"
+ 	"tailscale.com/types/logger"
+@@ -40,6 +41,14 @@ func newNetstack(logf logger.Logf, sys *tsd.System, onlyNetstack bool) (tsd.Nets
+ 	sys.Set(ns)
+ 	ns.ProcessLocalIPs = onlyNetstack
+ 	ns.ProcessSubnets = onlyNetstack || handleSubnetsInNetstack()
++	if runtime.GOOS == "haiku" {
++		// Haiku's userspace engine can receive TCP replies for a gVisor
++		// outbound endpoint while ProcessLocalIPs is false. Without this
++		// lookup, the reply is mistaken for a new forwarded connection and
++		// dropped before the LocalAPI dial tunnel can receive it.
++		ns.CheckLocalTransportEndpoints = true
++		logf("Haiku netstack: checking local transport endpoints")
++	}
+ 
+ 	dialer := sys.Dialer.Get() // must be set by caller already
+ 
+diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
+index d7c19f5..a228679 100644
+--- a/cmd/tailscaled/tailscaled.go
++++ b/cmd/tailscaled/tailscaled.go
+@@ -25,6 +25,7 @@
+ 	"runtime"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 	"time"
+ 
+@@ -80,7 +81,7 @@ func defaultTunName() string {
+ 		return "utun"
+ 	case "plan9":
+ 		return "auto"
+-	case "aix", "solaris", "illumos":
++	case "aix", "solaris", "illumos", "haiku":
+ 		return "userspace-networking"
+ 	case "linux":
+ 		if buildfeatures.HasSynology && buildfeatures.HasNetstack && distro.Get() == distro.Synology {
+@@ -540,9 +541,35 @@ func run() (err error) {
+ 		hostinfo.SetApp(app)
+ 	}
+ 
++	if runtime.GOOS == "haiku" {
++		startHaikuStallDumper(logf)
++	}
++
+ 	return startIPNServer(context.Background(), logf, publicLogID, sys)
+ }
+ 
++// startHaikuStallDumper dumps every goroutine's stack after
++// TS_HAIKU_STALL_DUMP seconds, so a startup that freezes leaves evidence.
++//
++// SIGQUIT is not usable here: sending it to a wedged tailscaled on Haiku
++// produces no dump at all. Like haikuListenerPoker this pins an OS thread and
++// paces with a raw nanosleep, because a wedge takes the Go timers down with it.
++func startHaikuStallDumper(logf logger.Logf) {
++	secs, err := strconv.Atoi(os.Getenv("TS_HAIKU_STALL_DUMP"))
++	if err != nil || secs <= 0 {
++		return
++	}
++	go func() {
++		runtime.LockOSThread()
++		defer runtime.UnlockOSThread()
++		ts := syscall.Timespec{Sec: int32(secs)}
++		syscall.Nanosleep(&ts, nil)
++		buf := make([]byte, 4<<20)
++		n := runtime.Stack(buf, true)
++		logf("Haiku stall dump after %ds:\n%s", secs, buf[:n])
++	}()
++}
++
+ var (
+ 	hookSetSysDrive           feature.Hook[func(*tsd.System, logger.Logf)]
+ 	hookSetWgEnginConfigDrive feature.Hook[func(*wgengine.Config, logger.Logf)]
+@@ -550,14 +577,176 @@ func run() (err error) {
+ 
+ var sigPipe os.Signal // set by sigpipe.go
+ 
++type haikuLocalAPIListener struct {
++	net.Listener
++	logf      logger.Logf
++	ready     *sync.Once
++	readyFile string
++}
++
++func (ln haikuLocalAPIListener) Accept() (net.Conn, error) {
++	ln.ready.Do(func() {
++		if ln.readyFile == "" {
++			return
++		}
++		if err := os.WriteFile(ln.readyFile, []byte("ready\n"), 0600); err != nil {
++			ln.logf("writing Haiku LocalAPI readiness marker: %v", err)
++			return
++		}
++		ln.logf("Haiku LocalAPI server: accept loop ready")
++	})
++	ln.logf("Haiku LocalAPI server: waiting for a connection")
++	// The netpoller usually delivers accept readiness, but not always: after a
++	// number of connections it can lose the listener's re-arm and then park
++	// here forever with the CPU idle - the daemon keeps running, the socket
++	// still exists, but every later `tailscale` command hangs (observed: 18
++	// accepts, then 19 minutes of nothing while clients timed out). Re-arm
++	// periodically so a missed wakeup costs at most one interval instead of
++	// wedging the LocalAPI permanently. The interval is deliberately long: an
++	// earlier 1s version fought the poller and only ever accepted the first
++	// connection.
++	c, err := ln.Listener.Accept()
++	ln.logf("Haiku LocalAPI server: accept completed (err=%v)", err)
++	if err != nil {
++		return c, err
++	}
++	// Wrap the accepted connection; see haikuLocalAPIWorkarounds. Without this
++	// the request is never read at all.
++	if haikuLocalAPIWorkarounds() {
++		return haikuAPIConn{Conn: c}, nil
++	}
++	return c, nil
++}
++
++// haikuLocalAPIWorkarounds reports whether the LocalAPI unix socket needs the
++// deadline/poker workarounds. It does, always, on Haiku.
++//
++// Turning them off was tried once sockets were on the netpoller, on the theory
++// that real readiness had made them redundant. It does not work: the daemon
++// still accepts connections ("accept completed (err=<nil>)" over and over) but
++// never reads a single request - zero /localapi lines - so every CLI call hangs
++// and the backend never leaves NoState. Haiku's poll() evidently does not report
++// read readiness for unix-domain sockets, which is why these workarounds exist
++// even though TCP sockets poll fine. Do not remove them; the switch is here so
++// the experiment is cheap to repeat if Haiku's poll gains unix-socket support.
++func haikuLocalAPIWorkarounds() bool {
++	return runtime.GOOS == "haiku" && !envknob.Bool("TS_HAIKU_NO_LOCALAPI_WORKAROUNDS")
++}
++
++// haikuAPIConn re-arms a kernel deadline around every Read and Write so a lost
++// netpoll wakeup costs one interval instead of hanging the connection. The retry
++// is transparent: a timeout is not returned to the caller, the operation is
++// simply reissued.
++//
++// Both directions need this. Haiku's poll() reports readiness for TCP sockets
++// but not for unix-domain sockets, and the LocalAPI socket is a unix socket, so
++// an operation that has to wait for readiness never resumes. Reads were covered
++// first, which was enough for request/response commands; the `tailscale nc`
++// dial tunnel then still hung, because the half that carries the peer's data
++// back to the client is a WRITE to this socket. Symptom: ssh through the tailnet
++// worked once or twice and then every later attempt timed out waiting for the
++// SSH banner, with the daemon idle and the dial logged as successful.
++type haikuAPIConn struct {
++	net.Conn
++}
++
++func (c haikuAPIConn) Write(p []byte) (int, error) {
++	written := 0
++	for {
++		if err := c.Conn.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
++			// Deadlines unsupported: fall back to a plain write.
++			n, err := c.Conn.Write(p[written:])
++			return written + n, err
++		}
++		n, err := c.Conn.Write(p[written:])
++		written += n
++		if err == nil {
++			c.Conn.SetWriteDeadline(time.Time{})
++			return written, nil
++		}
++		if ne, ok := err.(net.Error); ok && ne.Timeout() {
++			// Either the socket was full or the write-readiness wakeup was
++			// lost. Retry whatever is left; a partial write already counted.
++			if written < len(p) {
++				continue
++			}
++			c.Conn.SetWriteDeadline(time.Time{})
++			return written, nil
++		}
++		c.Conn.SetWriteDeadline(time.Time{})
++		return written, err
++	}
++}
++
++func (c haikuAPIConn) Read(p []byte) (int, error) {
++	for {
++		if err := c.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
++			// Deadlines unsupported: fall back to a plain read.
++			return c.Conn.Read(p)
++		}
++		n, err := c.Conn.Read(p)
++		if n > 0 || err == nil {
++			c.Conn.SetReadDeadline(time.Time{})
++			return n, err
++		}
++		if ne, ok := err.(net.Error); ok && ne.Timeout() {
++			// Nothing arrived (or the wakeup was lost) - poll again.
++			continue
++		}
++		c.Conn.SetReadDeadline(time.Time{})
++		return n, err
++	}
++}
++
++func haikuListenerPoker(ctx context.Context, socketPath string, logf logger.Logf) {
++	// Pin to its own OS thread and pace with a raw nanosleep instead of a Go
++	// timer. The whole reason this poker exists is that the Haiku netpoller
++	// stops waking things; its timers stop firing at the same moment, so a
++	// time.Ticker/time.Sleep-based poker dies exactly when it is needed (seen
++	// on hardware: accepts frozen at 23 while the poker added none). A syscall
++	// sleep on a dedicated thread keeps running regardless of the poller.
++	runtime.LockOSThread()
++	defer runtime.UnlockOSThread()
++	for {
++		if ctx.Err() != nil {
++			return
++		}
++		var ts syscall.Timespec
++		ts.Sec = 1
++		ts.Nsec = 0
++		syscall.Nanosleep(&ts, nil)
++		c, err := safesocket.Connect(socketPath)
++		if err != nil {
++			continue
++		}
++		// Connect and close immediately without sending anything: that is
++		// enough to wake a parked Accept, and http.Serve simply drops the
++		// resulting connection when it reads EOF.
++		c.Close()
++	}
++}
++
+ // logID may be the zero value if logging is not in use.
+ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID, sys *tsd.System) error {
+ 	ln, err := safesocket.Listen(args.socketpath)
+ 	if err != nil {
+ 		return fmt.Errorf("safesocket.Listen: %v", err)
+ 	}
++	if runtime.GOOS == "haiku" {
++		ln = haikuLocalAPIListener{
++			Listener:  ln,
++			logf:      logf,
++			ready:     new(sync.Once),
++			readyFile: "",
++		}
++	}
+ 
+ 	ctx, cancel := context.WithCancel(ctx)
++	if runtime.GOOS == "haiku" {
++		if haikuLocalAPIWorkarounds() {
++			go haikuListenerPoker(ctx, args.socketpath, logf)
++		}
++	}
+ 	defer cancel()
+ 	// Exit gracefully by cancelling the ipnserver context in most common cases:
+ 	// interrupted from the TTY or killed by a service manager.
+@@ -598,7 +787,7 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID,
+ 	}
+ 	var lbErr syncs.AtomicValue[error]
+ 
+-	go func() {
++	startBackend := func() {
+ 		t0 := time.Now()
+ 		if s, ok := envknob.LookupInt("TS_DEBUG_BACKEND_DELAY_SEC"); ok {
+ 			d := time.Duration(s) * time.Second
+@@ -613,7 +802,14 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID,
+ 		lb, err := getLocalBackend(ctx, logf, logID, sys)
+ 		if err == nil {
+ 			logf("got LocalBackend in %v", time.Since(t0).Round(time.Millisecond))
+-			if lb.Prefs().Valid() {
++			if runtime.GOOS == "haiku" {
++				logf("Haiku startup: checking saved backend preferences")
++			}
++			deferStart := runtime.GOOS == "haiku" && os.Getenv("TS_HAIKU_DEFER_START") == "1"
++			if lb.Prefs().Valid() && !deferStart {
++				if runtime.GOOS == "haiku" {
++					logf("Haiku startup: starting LocalBackend")
++				}
+ 				if err := lb.Start(ipn.Options{}); err != nil {
+ 					logf("LocalBackend.Start: %v", err)
+ 					lb.Shutdown()
+@@ -621,14 +817,39 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID,
+ 					cancel()
+ 					return
+ 				}
++			} else if deferStart {
++				logf("Haiku startup: deferring LocalBackend.Start to LocalAPI")
+ 			}
+ 			srv.SetLocalBackend(lb)
++			if runtime.GOOS == "haiku" {
++				logf("Haiku startup: LocalBackend registered with LocalAPI")
++				if readyFile := os.Getenv("TS_HAIKU_READY_FILE"); readyFile != "" {
++					if err := os.WriteFile(readyFile, []byte("ready\n"), 0600); err != nil {
++						logf("writing Haiku LocalAPI readiness marker: %v", err)
++					} else {
++						logf("Haiku LocalAPI fully ready")
++					}
++				}
++			}
+ 			close(wgEngineCreated)
+ 			return
+ 		}
+ 		lbErr.Store(err) // before the following cancel
+ 		cancel()         // make srv.Run below complete
+-	}()
++	}
++
++	// On the experimental Haiku/386 runtime, running the LocalAPI accept loop
++	// (srv.Run below) concurrently with the backend/WireGuard/DERP startup
++	// goroutines wedges the scheduler: the accept loop's periodic Accept
++	// deadline polling starves getLocalBackend, which never makes progress and
++	// never registers the backend, so readiness is never signaled. Serialize
++	// startup here: build and register the backend first, then start the accept
++	// loop. On other platforms keep the original concurrent behavior.
++	if runtime.GOOS == "haiku" {
++		startBackend()
++	} else {
++		go startBackend()
++	}
+ 
+ 	err = srv.Run(ctx, ln)
+ 
+@@ -650,6 +871,11 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID,
+ 
+ // logID may be the zero value if logging is not in use.
+ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID, sys *tsd.System) (_ *ipnlocal.LocalBackend, retErr error) {
++	traceHaikuStartup := func(message string) {
++		if runtime.GOOS == "haiku" {
++			logf("Haiku startup: %s", message)
++		}
++	}
+ 	if logPol != nil {
+ 		logPol.Logtail.SetNetMon(sys.NetMon.Get())
+ 	}
+@@ -667,6 +893,7 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
+ 	if err != nil {
+ 		return nil, fmt.Errorf("createEngine: %w", err)
+ 	}
++	traceHaikuStartup("WireGuard engine registered")
+ 	if onlyNetstack && !buildfeatures.HasNetstack {
+ 		return nil, errors.New("userspace-networking support is not compiled in to this binary")
+ 	}
+@@ -679,10 +906,12 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
+ 
+ 	var ns tsd.NetstackImpl // or nil if not linked in
+ 	if newNetstack, ok := hookNewNetstack.GetOk(); ok {
++		traceHaikuStartup("creating userspace netstack")
+ 		ns, err = newNetstack(logf, sys, onlyNetstack)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("newNetstack: %w", err)
+ 		}
++		traceHaikuStartup("userspace netstack created")
+ 	}
+ 
+ 	if startProxy != nil {
+@@ -691,6 +920,7 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
+ 
+ 	opts := ipnServerOpts()
+ 
++	traceHaikuStartup("opening state store")
+ 	store, err := store.New(logf, statePathOrDefault())
+ 	if err != nil {
+ 		// If we can't create the store (for example if it's TPM-sealed and the
+@@ -705,15 +935,20 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
+ 		ht.SetUnhealthy(ipn.StateStoreHealth, health.Args{health.ArgError: err.Error()})
+ 	}
+ 	sys.Set(store)
++	traceHaikuStartup("state store ready")
+ 
+ 	if w, ok := sys.Tun.GetOK(); ok {
++		traceHaikuStartup("starting fake TUN")
+ 		w.Start()
++		traceHaikuStartup("fake TUN started")
+ 	}
+ 
++	traceHaikuStartup("creating LocalBackend")
+ 	lb, err := ipnlocal.NewLocalBackend(logf, logID, sys, opts.LoginFlags)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("ipnlocal.NewLocalBackend: %w", err)
+ 	}
++	traceHaikuStartup("LocalBackend created")
+ 	if onlyNetstack {
+ 		dialer.UseNetstackForIP = func(ip netip.Addr) bool {
+ 			_, ok := lb.PeerForIP(ip)
+diff --git a/control/controlclient/direct.go b/control/controlclient/direct.go
+index 8ac6356..71e3581 100644
+--- a/control/controlclient/direct.go
++++ b/control/controlclient/direct.go
+@@ -366,7 +366,18 @@ func NewDirect(opts Options) (*Direct, error) {
+ 		dialFunc, interceptedDial = makeScreenTimeDetectingDialFunc(opts.Dialer.SystemDial)
+ 		tr.DialContext = dnscache.Dialer(dialFunc, dnsCache)
+ 		tr.DialTLSContext = dnscache.TLSDialer(dialFunc, dnsCache, tr.TLSClientConfig)
+-		tr.ForceAttemptHTTP2 = true
++		if runtime.GOOS == "haiku" {
++			// The key endpoint and Noise upgrade both support HTTP/1.1.
++			// Avoid an extra HTTP/2 reader goroutine on Haiku/386's
++			// blocking-socket runtime and keep the entire outer control
++			// transport under the deadline-aware HTTP/1 path. The inner
++			// Noise transport still uses HTTP/2 as required.
++			tr.ForceAttemptHTTP2 = false
++			tr.TLSClientConfig.NextProtos = []string{"http/1.1"}
++			tr.ResponseHeaderTimeout = 15 * time.Second
++		} else {
++			tr.ForceAttemptHTTP2 = true
++		}
+ 		// Disable implicit gzip compression; the various
+ 		// handlers (register, map, set-dns, etc) do their own
+ 		// zstd compression per naclbox.
+@@ -963,7 +974,32 @@ func (c *Direct) SetEndpoints(endpoints []tailcfg.Endpoint) (changed bool) {
+ // It always returns a non-nil error describing the reason for the failure or
+ // why the request ended.
+ func (c *Direct) PollNetMap(ctx context.Context, nu NetmapUpdater) error {
+-	return c.sendMapRequest(ctx, true, nu)
++	err := c.sendMapRequest(ctx, true, nu)
++	if err != nil && runtime.GOOS == "haiku" {
++		// The map long-poll runs over the cached Noise HTTP/2 client. On
++		// Haiku/386's blocking-socket runtime (no working netpoller), a dead
++		// control connection is not detected by the HTTP/2 transport, so the
++		// next PollNetMap would reuse the same wedged connection and hang
++		// forever - the node then silently stops its control heartbeat and the
++		// control plane marks it offline. Drop the cached Noise client on any
++		// poll failure so mapRoutine's retry dials a fresh connection.
++		c.invalidateNoiseClient()
++	}
++	return err
++}
++
++// invalidateNoiseClient closes and clears the cached Noise client so the next
++// getNoiseClient call dials a fresh control connection. See the Haiku note in
++// PollNetMap. Closing is non-blocking (it just closes fds and idle conns).
++func (c *Direct) invalidateNoiseClient() {
++	c.mu.Lock()
++	nc := c.noiseClient
++	c.noiseClient = nil
++	c.mu.Unlock()
++	if nc != nil {
++		c.logf("[v1] Haiku: dropping Noise client to force a fresh control reconnect")
++		nc.Close()
++	}
+ }
+ 
+ // rememberLastNetmapUpdater is a container that remembers the last netmap
+diff --git a/control/controlhttp/client.go b/control/controlhttp/client.go
+index d93e19b..02234a1 100644
+--- a/control/controlhttp/client.go
++++ b/control/controlhttp/client.go
+@@ -184,13 +184,13 @@ type dialResult struct {
+ // use HTTPS connections as its underlay connection (double crypto). This can
+ // be necessary when networks or middle boxes are messing with port 80.
+ func (d *Dialer) forceNoise443() bool {
+-	if runtime.GOOS == "plan9" {
+-		// For running demos of Plan 9 in a browser with network relays,
+-		// we want to minimize the number of connections we're making.
++	if runtime.GOOS == "plan9" || runtime.GOOS == "haiku" {
++		// Minimize the number of connections on platforms with constrained
++		// networking implementations.
+ 		// The main reason to use port 80 is to avoid double crypto
+-		// costs server-side but the costs are tiny and number of Plan 9
+-		// users doesn't make it worth it. Just disable this and always use
+-		// HTTPS for Plan 9. That also reduces some log spam.
++		// costs server-side, but the costs are tiny. Always using HTTPS is
++		// especially important on Haiku/386, where each blocking dial
++		// consumes an OS thread while runtime netpoll is unavailable.
+ 		return true
+ 	}
+ 	if forceNoise443() {
+@@ -503,6 +503,9 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, optAddr netip.Ad
+ 
+ 	tr.DialTLSContext = dnscache.TLSDialer(dialer, dns, tr.TLSClientConfig)
+ 	tr.DisableCompression = true
++	if runtime.GOOS == "haiku" {
++		tr.ResponseHeaderTimeout = 15 * time.Second
++	}
+ 
+ 	// (mis)use httptrace to extract the underlying net.Conn from the
+ 	// transport. The transport handles 101 Switching Protocols correctly,
+diff --git a/derp/derp_client.go b/derp/derp_client.go
+index cc792a2..6b911a0 100644
+--- a/derp/derp_client.go
++++ b/derp/derp_client.go
+@@ -11,6 +11,7 @@
+ 	"fmt"
+ 	"io"
+ 	"net/netip"
++	"runtime"
+ 	"sync"
+ 	"time"
+ 
+@@ -231,6 +232,8 @@ func (c *Client) send(dstKey key.NodePublic, pkt []byte) (ret error) {
+ 
+ 	c.wmu.Lock()
+ 	defer c.wmu.Unlock()
++	stopTimeout := c.startHaikuWriteTimeout()
++	defer stopTimeout()
+ 	if c.rate != nil {
+ 		pktLen := FrameHeaderLen + key.NodePublicRawLen + len(pkt)
+ 		if !c.rate.AllowN(c.clock.Now(), pktLen) {
+@@ -283,6 +286,36 @@ func (c *Client) ForwardPacket(srcKey, dstKey key.NodePublic, pkt []byte) (err e
+ 
+ func (c *Client) writeTimeoutFired() { c.nc.Close() }
+ 
++func (c *Client) startHaikuWriteTimeout() func() {
++	// Legacy blocking-socket workaround: the old Haiku build had no working
++	// netpoller, so a DERP write could block forever and the only recovery was
++	// to close the connection and reconnect. With the netpoll/preempt patches
++	// writes complete normally, and this 5s guillotine actively HURTS: a slow
++	// write (or a write that merely overlaps a 5s WireGuard handshake retry)
++	// tears down the DERP connection, so the handshake response never reaches
++	// the peer and the session never establishes - which is what made a dial to
++	// a subnet-routed host (e.g. ssh through the tailnet) time out at the SSH
++	// banner while inbound packets kept arriving. Enable only for the legacy
++	// path via TS_HAIKU_DERP_ONLY.
++	if runtime.GOOS != "haiku" {
++		return func() {}
++	}
++	// A watchdog is still needed: a DERP write can stop making progress even
++	// with the netpoll patches, and when that happens nothing recovers on its
++	// own - the peer keeps retrying its handshake (observed: 17 "Received
++	// handshake initiation" / 17 "Sending handshake response" and not a single
++	// response getting through) so the session never establishes and every dial
++	// through that peer times out. But the old 5s value was too aggressive: it
++	// is exactly the WireGuard handshake retry period, so it tore down healthy
++	// connections mid-handshake. 30s is long enough not to fight normal traffic
++	// and short enough to recover a genuinely stuck writer.
++	timer := c.clock.AfterFunc(30*time.Second, func() {
++		c.logf("derp: Haiku write blocked for 30s; closing connection for transparent reconnect")
++		c.writeTimeoutFired()
++	})
++	return func() { timer.Stop() }
++}
++
+ func (c *Client) SendPing(data [8]byte) error {
+ 	return c.sendPingOrPong(FramePing, data)
+ }
+@@ -294,6 +327,8 @@ func (c *Client) SendPong(data [8]byte) error {
+ func (c *Client) sendPingOrPong(typ FrameType, data [8]byte) error {
+ 	c.wmu.Lock()
+ 	defer c.wmu.Unlock()
++	stopTimeout := c.startHaikuWriteTimeout()
++	defer stopTimeout()
+ 	if err := WriteFrameHeader(c.bw, typ, 8); err != nil {
+ 		return err
+ 	}
+@@ -315,6 +350,8 @@ func (c *Client) NotePreferred(preferred bool) (err error) {
+ 
+ 	c.wmu.Lock()
+ 	defer c.wmu.Unlock()
++	stopTimeout := c.startHaikuWriteTimeout()
++	defer stopTimeout()
+ 
+ 	if err := WriteFrameHeader(c.bw, FrameNotePreferred, 1); err != nil {
+ 		return err
+@@ -478,6 +515,13 @@ func (ServerRestartingMessage) msg() {}
+ //
+ // Once Recv returns an error, the Client is dead forever.
+ func (c *Client) Recv() (m ReceivedMessage, err error) {
++	// Note: on Haiku/386 an earlier port used a short 15s timeout here to force
++	// periodic derphttp reconnects, on the theory that a blocking DERP read
++	// might not wake for later traffic. In practice the blocking read does wake
++	// on incoming data, so the short timeout only produced a reconnect (and a
++	// new TLS handshake) every ~20s, which pegged a CPU core on the slow 386.
++	// The standard 120s timeout matches the behavior of the run that reached
++	// "Tailscale is running" with a single, stable DERP connection.
+ 	return c.recvTimeout(120 * time.Second)
+ }
+ 
+diff --git a/derp/derphttp/derphttp_client.go b/derp/derphttp/derphttp_client.go
+index 2b048b5..bbbdef2 100644
+--- a/derp/derphttp/derphttp_client.go
++++ b/derp/derphttp/derphttp_client.go
+@@ -475,9 +475,28 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
+ 		// Force a handshake now (instead of waiting for it to
+ 		// be done implicitly on read/write) so we can check
+ 		// the ConnectionState.
++		if runtime.GOOS == "haiku" {
++			// On Haiku/386 this handshake can block forever: the connect and
++			// the first TLS read complete, then the read never wakes again, so
++			// the daemon sits at "connecting to derp-N" with no DERP link and
++			// therefore no data path at all. The control client works around
++			// the same problem with explicit I/O deadlines (see
++			// net/dnscache); do the same here so a stuck handshake fails and
++			// the caller's normal reconnect/backoff retries instead of hanging.
++			if err := tcpConn.SetDeadline(time.Now().Add(20 * time.Second)); err != nil {
++				return nil, 0, err
++			}
++		}
+ 		if err := tlsConn.Handshake(); err != nil {
+ 			return nil, 0, err
+ 		}
++		if runtime.GOOS == "haiku" {
++			// Clear it again: the DERP connection is long-lived, and its reads
++			// legitimately block for minutes waiting for packets.
++			if err := tcpConn.SetDeadline(time.Time{}); err != nil {
++				return nil, 0, err
++			}
++		}
+ 
+ 		// We expect to be using TLS 1.3 to our own servers, and only
+ 		// starting at TLS 1.3 are the server's returned certificates
+@@ -806,7 +825,11 @@ type res struct {
+ 	if shouldDialProto(n.IPv4, netip.Addr.Is4) {
+ 		startDial(n.IPv4, "tcp4")
+ 	}
+-	if shouldDialProto(n.IPv6, netip.Addr.Is6) {
++	// Haiku/386 has no working runtime netpoller yet. Racing an IPv6
++	// blocking connect against IPv4 consumes an additional OS thread and
++	// can starve the control and LocalAPI goroutines. DERP maps provide
++	// explicit IPv4 addresses, so use that single path.
++	if runtime.GOOS != "haiku" && shouldDialProto(n.IPv6, netip.Addr.Is6) {
+ 		startDial(n.IPv6, "tcp6")
+ 	}
+ 	if nwait == 0 {
+diff --git a/ipn/ipnlocal/local.go b/ipn/ipnlocal/local.go
+index 75e6223..ed483fe 100644
+--- a/ipn/ipnlocal/local.go
++++ b/ipn/ipnlocal/local.go
+@@ -539,6 +539,11 @@ type serveLabels struct {
+ //
+ // The logID may be the zero value if logging is not in use.
+ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, loginFlags controlclient.LoginFlags) (_ *LocalBackend, err error) {
++	traceHaikuStartup := func(message string) {
++		if runtime.GOOS == "haiku" {
++			logf("Haiku LocalBackend: %s", message)
++		}
++	}
+ 	e := sys.Engine.Get()
+ 	store := sys.StateStore.Get()
+ 	dialer := sys.Dialer.Get()
+@@ -558,6 +563,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	traceHaikuStartup("profile manager ready")
+ 	if sds, ok := store.(ipn.StateStoreDialerSetter); ok {
+ 		sds.SetDialer(dialer.SystemDial)
+ 	}
+@@ -604,6 +610,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
+ 		loginFlags:   loginFlags,
+ 		clock:        clock,
+ 	}
++	traceHaikuStartup("core state initialized")
+ 
+ 	sys.NoiseRoundTripper.Set(noiseRoundTripper{b})
+ 
+@@ -634,10 +641,12 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
+ 		return nil, fmt.Errorf("failed to create extension host: %w", err)
+ 	}
+ 	b.pm.SetExtensionHost(b.extHost)
++	traceHaikuStartup("extension host ready")
+ 
+ 	if b.unregisterSysPolicyWatch, err = b.registerSysPolicyWatch(); err != nil {
+ 		return nil, err
+ 	}
++	traceHaikuStartup("policy watcher ready")
+ 	defer func() {
+ 		if err != nil {
+ 			b.unregisterSysPolicyWatch()
+@@ -649,8 +658,9 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
+ 	if err != nil {
+ 		logf("error setting up sockstat logger: %v", err)
+ 	}
++	traceHaikuStartup("socket statistics logger initialized")
+ 	// Enable sockstats logs only on non-mobile unstable builds
+-	if version.IsUnstableBuild() && !version.IsMobile() && b.sockstatLogger != nil {
++	if version.IsUnstableBuild() && !version.IsMobile() && runtime.GOOS != "haiku" && b.sockstatLogger != nil {
+ 		b.sockstatLogger.SetLoggingEnabled(true)
+ 	}
+ 
+@@ -670,9 +680,18 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
+ 	cd, err := netmon.NewChangeDelta(nil, b.interfaceState, 0, false)
+ 	if err != nil {
+ 		b.logf("[unexpected] setting initial netmon state failed: %v", err)
++	} else if runtime.GOOS == "haiku" {
++		// Haiku currently has no OS router or DNS integration and starts
++		// with an empty static interface state. Running linkChange while the
++		// backend is still being assembled can race engine callbacks and
++		// intermittently prevent LocalAPI startup. The first control
++		// reconfiguration applies the effective state once the backend is
++		// fully registered.
++		traceHaikuStartup("skipping empty initial network reconfiguration")
+ 	} else {
+ 		b.linkChange(cd)
+ 	}
++	traceHaikuStartup("initial network state applied")
+ 
+ 	if buildfeatures.HasPeerAPIServer {
+ 		if tunWrap, ok := b.sys.Tun.GetOK(); ok {
+@@ -713,6 +732,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
+ 	eventbus.SubscribeFunc(ec, b.onAppConnectorStoreRoutes)
+ 	eventbus.SubscribeFunc(ec, b.onHomeDERPUpdate)
+ 	mConn.SetNetInfoCallback(b.setNetInfo) // TODO(tailscale/tailscale#17887): move to eventbus
++	traceHaikuStartup("event subscriptions ready")
+ 
+ 	if buildfeatures.HasDrive {
+ 		if f, ok := hookInstallDriveRemoteSource.GetOk(); ok {
+@@ -720,6 +740,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
+ 		}
+ 	}
+ 
++	traceHaikuStartup("initialization complete")
+ 	return b, nil
+ }
+ 
+@@ -1126,8 +1147,7 @@ func (b *LocalBackend) shouldPauseControlClientLocked(prefs ipn.PrefsView) bool
+ 		return true
+ 	}
+ 
+-	networkUp := b.interfaceState.AnyInterfaceUp()
+-	pauseForNetwork := !networkUp && !testenv.InTest() && !envknob.AssumeNetworkUp()
++	pauseForNetwork := !b.interfaceState.AnyInterfaceUp() && !testenv.InTest() && !envknob.AssumeNetworkUp()
+ 	if pauseForNetwork {
+ 		return true
+ 	}
+diff --git a/ipn/ipnserver/server.go b/ipn/ipnserver/server.go
+index 19efaf9..981cb65 100644
+--- a/ipn/ipnserver/server.go
++++ b/ipn/ipnserver/server.go
+@@ -345,6 +345,12 @@ func (a *actor) Permissions(operatorUID string) (read, write bool) {
+ 		// checks here. Note that this permission model is being changed in
+ 		// tailscale/corp#18342.
+ 		return true, true
++	case "haiku":
++		// Haiku does not currently expose peer credentials through the Go
++		// peercred package. The LocalAPI socket is created with mode 0600 in
++		// the daemon owner's settings directory, so successfully connecting
++		// to it is sufficient authentication.
++		return true, true
+ 	case "js", "plan9":
+ 		return true, true
+ 	}
+@@ -538,6 +544,14 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
+ 		},
+ 		ErrorLog: logger.StdLogger(logger.WithPrefix(s.logf, "ipnserver: ")),
+ 	}
++	if runtime.GOOS == "haiku" {
++		// The experimental Haiku/386 runtime uses blocking sockets without
++		// a network poller. An idle HTTP keep-alive connection can therefore
++		// occupy a scheduler thread and prevent a later LocalAPI connection
++		// from being accepted. LocalAPI requests are infrequent, so close each
++		// connection after its response and let the CLI reconnect.
++		hs.SetKeepAlivesEnabled(false)
++	}
+ 	if err := hs.Serve(ln); err != nil {
+ 		if err := ctx.Err(); err != nil {
+ 			return err
+diff --git a/ipn/localapi/localapi.go b/ipn/localapi/localapi.go
+index 2c88044..f4c926f 100644
+--- a/ipn/localapi/localapi.go
++++ b/ipn/localapi/localapi.go
+@@ -1370,20 +1370,152 @@ func (h *Handler) serveDial(w http.ResponseWriter, r *http.Request) {
+ 	if err := brw.Flush(); err != nil {
+ 		return
+ 	}
++	// haikuLegacyPump selects the old blocking-socket workaround: force the
++	// LocalAPI tunnel non-blocking and drive both directions with a manual
++	// deadline-based copy loop. With the netpoll/preempt patches the standard
++	// io.Copy path works and is used by default; the legacy pump manipulates
++	// deadlines on a socket the other direction is concurrently using, which on
++	// a working netpoller just interferes (repeat `tailscale nc` dials would
++	// stop moving data after the first one).
++	haikuLegacyPump := runtime.GOOS == "haiku" && envknob.Bool("TS_HAIKU_DERP_ONLY")
++	haikuNonblocking := false
++	if haikuLegacyPump {
++		if err := setHaikuNonblocking(reqConn); err != nil {
++			h.logf("localapi dial: could not make LocalAPI tunnel non-blocking; using deadline fallback: %v", err)
++		} else {
++			haikuNonblocking = true
++			h.logf("localapi dial: LocalAPI tunnel is non-blocking")
++		}
++	}
+ 	reqConn = netutil.NewDrainBufConn(reqConn, brw.Reader)
+ 
+-	errc := make(chan error, 1)
++	if haikuLegacyPump {
++		h.logf("localapi dial: starting Haiku deadline-driven bidirectional pump to %s", addr)
++	}
++
++	errc := make(chan error, 2)
+ 	go func() {
+-		_, err := io.Copy(reqConn, outConn)
++		var n int64
++		var err error
++		if haikuLegacyPump {
++			// outConn is a gVisor gonet.TCPConn. Its waiter-based Read is
++			// scheduler-friendly already. Do not change the Unix-socket
++			// write deadline while its other half is blocked in Read;
++			// Haiku's socket option path can serialize those operations.
++			n, err = copyHaikuDialConn(reqConn, outConn, false, false, h.logf, "peer-to-client")
++		} else {
++			n, err = io.Copy(reqConn, outConn)
++		}
++		if runtime.GOOS == "haiku" {
++			h.logf("localapi dial: peer-to-client pump stopped after %d bytes: %v", n, err)
++		}
+ 		errc <- err
+ 	}()
+ 	go func() {
+-		_, err := io.Copy(outConn, reqConn)
++		var n int64
++		var err error
++		if haikuLegacyPump {
++			// reqConn is the real Haiku Unix socket and needs a read
++			// deadline only if switching it to non-blocking mode failed.
++			// Writes to the gVisor connection use its waiter queue and must
++			// not be interrupted by a recurring timer.
++			n, err = copyHaikuDialConn(outConn, reqConn, false, !haikuNonblocking, h.logf, "client-to-peer")
++		} else {
++			n, err = io.Copy(outConn, reqConn)
++		}
++		if runtime.GOOS == "haiku" {
++			h.logf("localapi dial: client-to-peer pump stopped after %d bytes: %v", n, err)
++		}
+ 		errc <- err
+ 	}()
+ 	<-errc
+ }
+ 
++// copyHaikuDialConn copies one half of a LocalAPI dial tunnel. wakeSrc and
++// wakeDst identify real Haiku sockets whose blocking syscalls need periodic
++// kernel deadlines. They must be false for gVisor gonet connections: those
++// connections already use scheduler-friendly waiter channels, and repeatedly
++// expiring their time.AfterFunc deadlines can discard a packet notification.
++func copyHaikuDialConn(dst, src net.Conn, wakeDst, wakeSrc bool, logf logger.Logf, direction string) (written int64, retErr error) {
++	const wakeInterval = time.Second
++	if logf == nil {
++		logf = logger.Discard
++	}
++	buf := make([]byte, 32<<10)
++	logf("localapi dial: %s pump entered (wakeSrc=%v, wakeDst=%v)", direction, wakeSrc, wakeDst)
++	firstData := true
++	firstWrite := true
++	readTimeouts := 0
++	writeTimeouts := 0
++	for {
++		if wakeSrc {
++			_ = src.SetReadDeadline(time.Now().Add(wakeInterval))
++		}
++		nr, readErr := src.Read(buf)
++		if nr > 0 {
++			readTimeouts = 0
++			if firstData {
++				firstData = false
++				logf("localapi dial: %s received first %d bytes", direction, nr)
++			}
++			for off := 0; off < nr; {
++				if wakeDst {
++					_ = dst.SetWriteDeadline(time.Now().Add(wakeInterval))
++				}
++				nw, writeErr := dst.Write(buf[off:nr])
++				if nw > 0 {
++					off += nw
++					written += int64(nw)
++					writeTimeouts = 0
++					if firstWrite {
++						firstWrite = false
++						logf("localapi dial: %s forwarded first %d bytes", direction, nw)
++					}
++				}
++				if writeErr != nil {
++					if retryHaikuIO(writeErr) {
++						writeTimeouts++
++						if writeTimeouts%500 == 0 {
++							logf("localapi dial: %s write still blocked after %v", direction, time.Duration(writeTimeouts)*10*time.Millisecond)
++						}
++						time.Sleep(10 * time.Millisecond)
++						continue
++					}
++					return written, writeErr
++				}
++				if nw == 0 {
++					return written, io.ErrNoProgress
++				}
++			}
++		}
++		if readErr != nil {
++			if retryHaikuIO(readErr) {
++				readTimeouts++
++				if readTimeouts%500 == 0 {
++					logf("localapi dial: %s read idle for %v", direction, time.Duration(readTimeouts)*10*time.Millisecond)
++				}
++				time.Sleep(10 * time.Millisecond)
++				continue
++			}
++			if errors.Is(readErr, io.EOF) {
++				return written, nil
++			}
++			return written, readErr
++		}
++	}
++}
++
++func retryHaikuIO(err error) bool {
++	if ne, ok := err.(net.Error); ok && (ne.Timeout() || ne.Temporary()) {
++		return true
++	}
++	type temporary interface {
++		Temporary() bool
++	}
++	te, ok := err.(temporary)
++	return ok && te.Temporary()
++}
++
+ func (h *Handler) serveSetPushDeviceToken(w http.ResponseWriter, r *http.Request) {
+ 	if !h.PermitWrite {
+ 		http.Error(w, "set push device token access denied", http.StatusForbidden)
+diff --git a/ipn/localapi/nonblock_haiku.go b/ipn/localapi/nonblock_haiku.go
+new file mode 100644
+index 0000000..bab9dfa
+--- /dev/null
++++ b/ipn/localapi/nonblock_haiku.go
+@@ -0,0 +1,34 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package localapi
++
++import (
++	"errors"
++	"net"
++	"syscall"
++)
++
++// setHaikuNonblocking switches the hijacked LocalAPI socket to explicit
++// non-blocking I/O. The Haiku/386 Go port cannot register sockets with the
++// runtime netpoller, and SO_RCVTIMEO does not reliably wake a connected Unix
++// socket after its first read.
++func setHaikuNonblocking(c net.Conn) error {
++	sc, ok := c.(syscall.Conn)
++	if !ok {
++		return errors.New("connection does not expose syscall.Conn")
++	}
++	raw, err := sc.SyscallConn()
++	if err != nil {
++		return err
++	}
++	var setErr error
++	if err := raw.Control(func(fd uintptr) {
++		setErr = syscall.SetNonblock(int(fd), true)
++	}); err != nil {
++		return err
++	}
++	return setErr
++}
+diff --git a/ipn/localapi/nonblock_other.go b/ipn/localapi/nonblock_other.go
+new file mode 100644
+index 0000000..bba7c27
+--- /dev/null
++++ b/ipn/localapi/nonblock_other.go
+@@ -0,0 +1,10 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !haiku
++
++package localapi
++
++import "net"
++
++func setHaikuNonblocking(net.Conn) error { return nil }
+diff --git a/ipn/store/stores.go b/ipn/store/stores.go
+index 31a0553..e45e946 100644
+--- a/ipn/store/stores.go
++++ b/ipn/store/stores.go
+@@ -9,6 +9,7 @@
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"iter"
+ 	"maps"
+ 	"os"
+@@ -75,6 +76,13 @@ func New(logf logger.Logf, path string) (ipn.StateStore, error) {
+ 	if runtime.GOOS == "windows" {
+ 		path = TryWindowsAppDataMigration(logf, path)
+ 	}
++	if runtime.GOOS == "haiku" {
++		// The experimental Go Haiku/386 port cannot currently use stat/fstat
++		// reliably. In particular, os.ReadFile and os.MkdirAll both stat their
++		// target and can block forever. Use the stat-free file store below,
++		// while preserving the normal on-disk JSON state format.
++		return newHaikuFileStore(logf, path)
++	}
+ 	if err := maybeMigrateLocalStateFile(logf, path); err != nil {
+ 		return nil, fmt.Errorf("failed to migrate existing TPM-sealed state file to plaintext format: %w", err)
+ 	}
+@@ -143,12 +151,111 @@ func TryWindowsAppDataMigration(logf logger.Logf, path string) string {
+ 
+ // FileStore is a StateStore that uses a JSON file for persistence.
+ type FileStore struct {
+-	path string
++	path           string
++	statFreeWrites bool
+ 
+ 	mu    sync.RWMutex
+ 	cache map[ipn.StateKey][]byte
+ }
+ 
++// newHaikuFileStore opens a persistent state store without stat or fstat.
++// Remove this once the Go Haiku/386 stat ABI is fully implemented.
++func newHaikuFileStore(logf logger.Logf, path string) (ipn.StateStore, error) {
++	logf("Haiku state: ensuring state directory")
++	if err := mkdirAllWithoutStat(filepath.Dir(path), 0700); err != nil {
++		return nil, fmt.Errorf("creating state directory: %w", err)
++	}
++
++	logf("Haiku state: opening %q", path)
++	f, err := os.Open(path)
++	if err != nil {
++		if !os.IsNotExist(err) {
++			return nil, err
++		}
++		logf("Haiku state: creating a new state file")
++		if err := os.WriteFile(path, []byte("{}"), 0600); err != nil {
++			return nil, err
++		}
++		return &FileStore{
++			path:           path,
++			statFreeWrites: true,
++			cache:          map[ipn.StateKey][]byte{},
++		}, nil
++	}
++	bs, readErr := haikuReadAll(f)
++	closeErr := f.Close()
++	if readErr != nil {
++		return nil, readErr
++	}
++	if closeErr != nil {
++		return nil, closeErr
++	}
++	if len(bs) == 0 {
++		bs = []byte("{}")
++	}
++
++	ret := &FileStore{
++		path:           path,
++		statFreeWrites: true,
++		cache:          map[ipn.StateKey][]byte{},
++	}
++	if err := json.Unmarshal(bs, &ret.cache); err != nil {
++		return nil, err
++	}
++	logf("Haiku state: state file loaded")
++	return ret, nil
++}
++
++// haikuReadAll reads all of f without ever issuing the trailing zero-byte
++// read that io.ReadAll performs to detect EOF.
++//
++// On the experimental Haiku/386 runtime, read() on a regular file does not
++// reliably return 0 at end-of-file: after the final bytes are consumed, the
++// next read() blocks forever instead of reporting EOF. That made the daemon
++// hang while loading an existing tailscaled.state (writes went through the
++// same os.File path fine; only the read-until-EOF loop wedged).
++//
++// State files are small JSON blobs, so we read into a generously sized buffer
++// and treat any short read as end-of-file. A short read from a regular file
++// means we have reached the end, so we stop before the read that would block.
++func haikuReadAll(f *os.File) ([]byte, error) {
++	const chunk = 1 << 20 // 1 MiB; far larger than any real state file
++	var out []byte
++	buf := make([]byte, chunk)
++	for {
++		n, err := f.Read(buf)
++		if n > 0 {
++			out = append(out, buf[:n]...)
++		}
++		if err != nil {
++			if err == io.EOF {
++				return out, nil
++			}
++			return out, err
++		}
++		if n < len(buf) {
++			// A short read on a regular file means EOF was reached. Stop
++			// here instead of calling Read again, which Haiku/386 would
++			// block on rather than returning (0, io.EOF).
++			return out, nil
++		}
++		// Full buffer: the file may be larger than one chunk, so keep going.
++	}
++}
++
++func mkdirAllWithoutStat(path string, perm os.FileMode) error {
++	parent := filepath.Dir(path)
++	if parent != path {
++		if err := mkdirAllWithoutStat(parent, perm); err != nil {
++			return err
++		}
++	}
++	if err := os.Mkdir(path, perm); err != nil && !os.IsExist(err) {
++		return err
++	}
++	return nil
++}
++
+ // Path returns the path that NewFileStore was called with.
+ func (s *FileStore) Path() string { return s.path }
+ 
+@@ -223,6 +330,9 @@ func (s *FileStore) WriteState(id ipn.StateKey, bs []byte) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	if s.statFreeWrites {
++		return os.WriteFile(s.path, bs, 0600)
++	}
+ 	return atomicfile.WriteFile(s.path, bs, 0600)
+ }
+ 
+diff --git a/net/dnscache/dnscache.go b/net/dnscache/dnscache.go
+index 6aac8e7..8a2b31c 100644
+--- a/net/dnscache/dnscache.go
++++ b/net/dnscache/dnscache.go
+@@ -6,6 +6,7 @@
+ package dnscache
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"crypto/tls"
+ 	"errors"
+@@ -30,6 +31,170 @@
+ 
+ var zaddr netip.Addr
+ 
++// haikuHTTPResponseConn keeps a kernel deadline installed until the first
++// HTTP response header has arrived. Haiku/x86 uses blocking sockets without
++// the Go netpoller, so canceling an HTTP request does not reliably wake a
++// goroutine blocked in read(2). In particular, a control Noise upgrade could
++// otherwise remain stuck forever after the TLS handshake.
++//
++// Once the header is complete the deadline is removed. The connection handed
++// to the caller after a 101 response is long-lived and must not retain an
++// absolute or idle deadline.
++type haikuHTTPResponseConn struct {
++	net.Conn
++	mu          sync.Mutex
++	logf        logger.Logf
++	header      []byte
++	headerDone  bool
++	h2          bool
++	h2Headers   bool
++	readLogged  bool
++	writeLogged bool
++	// deadlineArmed records that the single header-exchange deadline is set;
++	// deadlineCleared that it has been dropped after the first bytes arrived.
++	deadlineArmed   bool
++	deadlineCleared bool
++}
++
++// armDeadline sets the one absolute deadline for the header exchange, on the
++// first call only.
++//
++// It must NOT re-arm per operation. SetDeadline sets the read and write
++// deadlines together, and HTTP/2 drives this connection from two goroutines, so
++// re-arming on every call let the writer keep pushing the reader's deadline into
++// the future - the timeout could then never fire and a stalled header wait hung
++// forever. Observed on hardware as the daemon parked at "writing HTTP request"
++// for minutes with a supposedly 15s deadline armed.
++//
++// One absolute deadline is also the correct semantics here: the bound is on the
++// whole header exchange, not on each individual syscall.
++func (c *haikuHTTPResponseConn) armDeadline(operation string) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.headerDone {
++		return nil
++	}
++
++	if c.logf != nil {
++		switch operation {
++		case "read":
++			if !c.readLogged {
++				c.readLogged = true
++				c.logf("Haiku control: waiting for HTTP response header")
++			}
++		case "write":
++			if !c.writeLogged {
++				c.writeLogged = true
++				c.logf("Haiku control: writing HTTP request")
++			}
++		}
++	}
++	if c.deadlineArmed {
++		return nil
++	}
++	c.deadlineArmed = true
++	return c.Conn.SetDeadline(time.Now().Add(30 * time.Second))
++}
++
++func (c *haikuHTTPResponseConn) Write(p []byte) (n int, err error) {
++	if err := c.armDeadline("write"); err != nil {
++		return 0, err
++	}
++	n, err = c.Conn.Write(p)
++	if err != nil && c.logf != nil {
++		c.logf("Haiku control: writing HTTP request failed: %v", err)
++	}
++	return n, err
++}
++
++func (c *haikuHTTPResponseConn) Read(p []byte) (n int, err error) {
++	if err := c.armDeadline("read"); err != nil {
++		return 0, err
++	}
++	n, err = c.Conn.Read(p)
++
++	c.mu.Lock()
++	if !c.headerDone && n > 0 {
++		// Clear the deadline as soon as ANY bytes arrive.
++		//
++		// The deadline exists only to bound a connection that produces nothing
++		// at all. Keeping it armed until a complete header block is recognised
++		// is too clever and actively dangerous: if the h2 accounting below fails
++		// to spot completion, the deadline later kills a healthy long-lived
++		// connection. That is what happened to the control-plane map poll - it
++		// died 30s in with "mapRoutine: context done" and "PollNetMap:
++		// unexpected EOF", and the backend never got a netmap, so `tailscale up`
++		// never reached Running. The header accounting is kept below for its
++		// logging, but it no longer decides when the deadline is dropped.
++		if !c.deadlineCleared {
++			c.deadlineCleared = true
++			if clearErr := c.Conn.SetDeadline(time.Time{}); clearErr != nil && err == nil {
++				err = clearErr
++			}
++		}
++	}
++	if !c.headerDone && n > 0 {
++		c.header = append(c.header, p[:n]...)
++		headerComplete := false
++		var parseErr error
++		if c.h2 {
++			headerComplete, parseErr = c.consumeH2Frames()
++		} else {
++			headerComplete = bytes.Contains(c.header, []byte("\r\n\r\n"))
++		}
++		if parseErr != nil && err == nil {
++			err = parseErr
++		}
++		if headerComplete {
++			c.headerDone = true
++			c.header = nil
++			if clearErr := c.Conn.SetDeadline(time.Time{}); clearErr != nil && err == nil {
++				err = clearErr
++			}
++			if c.logf != nil {
++				c.logf("Haiku control: HTTP response header completed; cleared I/O deadline")
++			}
++		} else if len(c.header) > 64<<10 {
++			err = errors.New("Haiku control: HTTP response header exceeds 64 KiB")
++		}
++	}
++	headerDone := c.headerDone
++	c.mu.Unlock()
++
++	if !headerDone && err != nil && c.logf != nil {
++		c.logf("Haiku control: waiting for HTTP response header failed: %v", err)
++	}
++	return n, err
++}
++
++// consumeH2Frames consumes complete HTTP/2 frames buffered in c.header and
++// reports whether a complete response header block has arrived. The server
++// sends SETTINGS before the response HEADERS, so clearing the deadline after
++// the first successful Read would still permit a permanent header stall.
++// c.mu must be held.
++func (c *haikuHTTPResponseConn) consumeH2Frames() (bool, error) {
++	for len(c.header) >= 9 {
++		payloadLen := int(c.header[0])<<16 | int(c.header[1])<<8 | int(c.header[2])
++		frameLen := 9 + payloadLen
++		if frameLen > 64<<10 {
++			return false, errors.New("Haiku control: HTTP/2 frame exceeds 64 KiB before response headers")
++		}
++		if len(c.header) < frameLen {
++			return false, nil
++		}
++		frameType := c.header[3]
++		flags := c.header[4]
++		if frameType == 0x1 { // HEADERS
++			c.h2Headers = true
++		}
++		if c.h2Headers && (frameType == 0x1 || frameType == 0x9) && flags&0x4 != 0 { // END_HEADERS
++			return true, nil
++		}
++		c.header = c.header[frameLen:]
++	}
++	return false, nil
++}
++
+ var single = &Resolver{
+ 	Forward: &net.Resolver{PreferGo: preferGoResolver()},
+ }
+@@ -297,6 +462,42 @@ func (r *Resolver) lookupIP(ctx context.Context, host string) (ip, ip6 netip.Add
+ 	var ips []netip.Addr
+ 	if r.LookupIPForTest != nil && testenv.InTest() {
+ 		ips, err = r.LookupIPForTest(ctx, host)
++	} else if runtime.GOOS == "haiku" && host == "controlplane.tailscale.com" {
++		// Haiku/386 currently has no working runtime netpoller. A connection
++		// to an unreachable bootstrap DERP server therefore consumes an OS
++		// thread and cannot reliably be canceled by the lookup context. Use
++		// Tailscale's control-plane anycast address directly for the default
++		// control hostname; TLS still authenticates the hostname.
++		if r.Logf != nil {
++			r.Logf("Haiku DNS: using built-in control-plane anycast address for %q", host)
++		}
++		ips = []netip.Addr{
++			netip.MustParseAddr("192.200.0.101"),
++			netip.MustParseAddr("192.200.0.102"),
++			netip.MustParseAddr("192.200.0.103"),
++			netip.MustParseAddr("192.200.0.104"),
++			netip.MustParseAddr("192.200.0.105"),
++			netip.MustParseAddr("192.200.0.106"),
++			netip.MustParseAddr("192.200.0.107"),
++			netip.MustParseAddr("192.200.0.108"),
++			netip.MustParseAddr("192.200.0.109"),
++			netip.MustParseAddr("192.200.0.110"),
++			netip.MustParseAddr("192.200.0.111"),
++			netip.MustParseAddr("192.200.0.112"),
++			netip.MustParseAddr("192.200.0.113"),
++			netip.MustParseAddr("192.200.0.114"),
++			netip.MustParseAddr("192.200.0.115"),
++			netip.MustParseAddr("192.200.0.116"),
++		}
++	} else if runtime.GOOS == "haiku" && r.LookupIPFallback != nil {
++		// The experimental Haiku port currently uses blocking sockets because
++		// runtime netpoll is unavailable. A blocked UDP system-DNS query cannot
++		// be interrupted by the lookup context, so use Tailscale's fixed-IP
++		// bootstrap DNS path first.
++		if r.Logf != nil {
++			r.Logf("Haiku DNS: resolving %q with bootstrap DNS", host)
++		}
++		ips, err = r.LookupIPFallback(lookupCtx, host)
+ 	} else {
+ 		ips, err = r.fwd().LookupNetIP(lookupCtx, "ip", host)
+ 	}
+@@ -576,34 +777,134 @@ func (dc *dialCall) raceDial(ctx context.Context, ips []netip.Addr) (net.Conn, e
+ }
+ 
+ // TLSDialer is like Dialer but returns a func suitable for using with net/http.Transport.DialTLSContext.
+-// It returns a *tls.Conn type on success.
++// It normally returns a *tls.Conn on success. On Haiku, connections are
++// wrapped temporarily so a missing HTTP/1 or HTTP/2 response header cannot
++// block forever.
+ // On TLS cert validation failure, it can invoke a backup DNS resolution strategy.
+ func TLSDialer(fwd netx.DialFunc, dnsCache *Resolver, tlsConfigBase *tls.Config) netx.DialFunc {
+ 	tcpDialer := Dialer(fwd, dnsCache)
+ 	return func(ctx context.Context, network, address string) (net.Conn, error) {
+-		host, _, err := net.SplitHostPort(address)
++		host, port, err := net.SplitHostPort(address)
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		dialTLS := func(dialCtx context.Context, dialAddress string) (net.Conn, error) {
++			if runtime.GOOS == "haiku" && dnsCache.Logf != nil {
++				dnsCache.Logf("Haiku control: dialing TCP %q", dialAddress)
++			}
++			tcpConn, err := fwd(dialCtx, network, dialAddress)
++			if err != nil {
++				return nil, err
++			}
++			if runtime.GOOS == "haiku" && dnsCache.Logf != nil {
++				dnsCache.Logf("Haiku control: TCP connected to %q", dialAddress)
++			}
++
++			cfg := cloneTLSConfig(tlsConfigBase)
++			if cfg.ServerName == "" {
++				cfg.ServerName = host
++			}
++			tlsConn := tls.Client(tcpConn, cfg)
++
++			handshakeTimeout := 5 * time.Second
++			if runtime.GOOS == "haiku" {
++				handshakeTimeout = 30 * time.Second
++			}
++			handshakeCtx, handshakeTimeoutCancel := context.WithTimeout(dialCtx, handshakeTimeout)
++			defer handshakeTimeoutCancel()
++			if runtime.GOOS == "haiku" {
++				// HandshakeContext cancels by closing the connection, but a
++				// close does not reliably interrupt a blocking read on Haiku.
++				// Put the deadline in the kernel so SO_RCVTIMEO/SO_SNDTIMEO
++				// force the syscall to return and allow candidate failover.
++				deadline, ok := handshakeCtx.Deadline()
++				if !ok {
++					deadline = time.Now().Add(handshakeTimeout)
++				}
++				if err := tlsConn.SetDeadline(deadline); err != nil {
++					tcpConn.Close()
++					return nil, fmt.Errorf("setting Haiku TLS handshake deadline: %w", err)
++				}
++			}
++			if runtime.GOOS == "haiku" && dnsCache.Logf != nil {
++				dnsCache.Logf("Haiku control: starting TLS handshake with %q via %q", host, dialAddress)
++			}
++			if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
++				tcpConn.Close()
++				return nil, err
++			}
++			if runtime.GOOS == "haiku" {
++				if err := tlsConn.SetDeadline(time.Time{}); err != nil {
++					tcpConn.Close()
++					return nil, fmt.Errorf("clearing Haiku TLS handshake deadline: %w", err)
++				}
++			}
++			if runtime.GOOS == "haiku" && dnsCache.Logf != nil {
++				dnsCache.Logf("Haiku control: TLS handshake completed with %q via %q", host, dialAddress)
++			}
++			if runtime.GOOS == "haiku" {
++				// Bound the first complete response header for both HTTP/1
++				// and HTTP/2 with a single absolute deadline. For a 101
++				// response the connection is handed to the Noise transport, so
++				// no deadline may remain afterward.
++				conn := &haikuHTTPResponseConn{
++					Conn: tlsConn,
++					h2:   tlsConn.ConnectionState().NegotiatedProtocol == "h2",
++					logf: dnsCache.Logf,
++				}
++				if err := conn.armDeadline("handshake"); err != nil {
++					tcpConn.Close()
++					return nil, fmt.Errorf("arming Haiku HTTP deadline: %w", err)
++				}
++				if dnsCache.Logf != nil {
++					dnsCache.Logf("Haiku control: armed 30s HTTP header deadline")
++				}
++				return conn, nil
++			}
++			return tlsConn, nil
++		}
++
++		if runtime.GOOS == "haiku" && host == "controlplane.tailscale.com" {
++			_, _, ips, err := dnsCache.LookupIP(ctx, host)
++			if err != nil {
++				return nil, err
++			}
++			if len(ips) == 0 {
++				return nil, errors.New("no Haiku control-plane IP candidates")
++			}
++			// A TCP connect alone is not sufficient to select an anycast
++			// endpoint: an unhealthy path can accept SYN and then stop before
++			// ServerHello. Try up to four rotating candidates and require the
++			// complete TLS handshake to succeed.
++			start := int(time.Now().UnixNano() % int64(len(ips)))
++			var errs []error
++			for n := 0; n < min(4, len(ips)); n++ {
++				ip := ips[(start+n)%len(ips)]
++				dialAddress := net.JoinHostPort(ip.String(), port)
++				attemptCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
++				conn, err := dialTLS(attemptCtx, dialAddress)
++				cancel()
++				if err == nil {
++					return conn, nil
++				}
++				errs = append(errs, fmt.Errorf("%s: %w", dialAddress, err))
++			}
++			return nil, errors.Join(errs...)
++		}
++
+ 		tcpConn, err := tcpDialer(ctx, network, address)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-
+ 		cfg := cloneTLSConfig(tlsConfigBase)
+ 		if cfg.ServerName == "" {
+ 			cfg.ServerName = host
+ 		}
+ 		tlsConn := tls.Client(tcpConn, cfg)
+-
+ 		handshakeCtx, handshakeTimeoutCancel := context.WithTimeout(ctx, 5*time.Second)
+ 		defer handshakeTimeoutCancel()
+ 		if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
+ 			tcpConn.Close()
+-			// TODO: if err != errTLSHandshakeTimeout,
+-			// assume it might be some captive portal or
+-			// otherwise incorrect DNS and try the backup
+-			// DNS mechanism.
+ 			return nil, err
+ 		}
+ 		return tlsConn, nil
+diff --git a/net/dnscache/dnscache_test.go b/net/dnscache/dnscache_test.go
+index 9306c62..ad6f0ce 100644
+--- a/net/dnscache/dnscache_test.go
++++ b/net/dnscache/dnscache_test.go
+@@ -20,6 +20,33 @@
+ 
+ var dialTest = flag.String("dial-test", "", "if non-empty, addr:port to test dial")
+ 
++func TestHaikuHTTP2ResponseHeader(t *testing.T) {
++	frame := func(frameType, flags byte, payload string) []byte {
++		n := len(payload)
++		b := []byte{byte(n >> 16), byte(n >> 8), byte(n), frameType, flags, 0, 0, 0, 1}
++		return append(b, payload...)
++	}
++
++	c := &haikuHTTPResponseConn{h2: true}
++	c.header = append(c.header, frame(0x4, 0, "")...) // SETTINGS
++	done, err := c.consumeH2Frames()
++	if err != nil || done {
++		t.Fatalf("SETTINGS: done=%v, err=%v", done, err)
++	}
++
++	c.header = append(c.header, frame(0x1, 0, "header fragment")...) // HEADERS
++	done, err = c.consumeH2Frames()
++	if err != nil || done {
++		t.Fatalf("HEADERS without END_HEADERS: done=%v, err=%v", done, err)
++	}
++
++	c.header = append(c.header, frame(0x9, 0x4, "continuation")...) // CONTINUATION|END_HEADERS
++	done, err = c.consumeH2Frames()
++	if err != nil || !done {
++		t.Fatalf("CONTINUATION with END_HEADERS: done=%v, err=%v", done, err)
++	}
++}
++
+ func TestDialer(t *testing.T) {
+ 	if *dialTest == "" {
+ 		t.Skip("skipping; --dial-test is blank")
+diff --git a/net/netmon/state.go b/net/netmon/state.go
+index 94554dc..4d69669 100644
+--- a/net/netmon/state.go
++++ b/net/netmon/state.go
+@@ -532,7 +532,7 @@ func (s *State) HasPAC() bool { return s != nil && s.PAC != "" }
+ 
+ // AnyInterfaceUp reports whether any interface seems like it has Internet access.
+ func (s *State) AnyInterfaceUp() bool {
+-	if runtime.GOOS == "js" || runtime.GOOS == "tamago" {
++	if runtime.GOOS == "js" || runtime.GOOS == "tamago" || runtime.GOOS == "haiku" {
+ 		return true
+ 	}
+ 	return s != nil && (s.HaveV4 || s.HaveV6)
+diff --git a/net/tstun/tstun_stub.go b/net/tstun/tstun_stub.go
+index 27d530b..07eb4fd 100644
+--- a/net/tstun/tstun_stub.go
++++ b/net/tstun/tstun_stub.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build aix || solaris || illumos
++//go:build aix || solaris || illumos || haiku
+ 
+ package tstun
+ 
+diff --git a/net/tstun/tun.go b/net/tstun/tun.go
+index 42b0d23..d718c2c 100644
+--- a/net/tstun/tun.go
++++ b/net/tstun/tun.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !wasm && !tamago && !aix && !solaris && !illumos
++//go:build !wasm && !tamago && !aix && !solaris && !illumos && !haiku
+ 
+ // Package tun creates a tuntap device, working around OS-specific
+ // quirks if necessary.
+diff --git a/paths/access_haiku.go b/paths/access_haiku.go
+new file mode 100644
+index 0000000..99a91ed
+--- /dev/null
++++ b/paths/access_haiku.go
+@@ -0,0 +1,10 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package paths
++
++import "syscall"
++
++func accessReadWrite(path string) error { return syscall.Access(path, syscall.O_RDWR) }
+diff --git a/paths/access_other.go b/paths/access_other.go
+new file mode 100644
+index 0000000..b75bd4c
+--- /dev/null
++++ b/paths/access_other.go
+@@ -0,0 +1,10 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !haiku && !windows && !wasm && !plan9 && !tamago
++
++package paths
++
++import "golang.org/x/sys/unix"
++
++func accessReadWrite(path string) error { return unix.Access(path, unix.O_RDWR) }
+diff --git a/paths/paths.go b/paths/paths.go
+index 398d8b2..33984d4 100644
+--- a/paths/paths.go
++++ b/paths/paths.go
+@@ -31,6 +31,9 @@ func DefaultTailscaledSocket() string {
+ 	if runtime.GOOS == "plan9" {
+ 		return "/srv/tailscaled.sock"
+ 	}
++	if runtime.GOOS == "haiku" {
++		return "/boot/home/config/settings/tailscale/tailscaled.sock"
++	}
+ 	switch distro.Get() {
+ 	case distro.Synology:
+ 		if distro.DSMVersion() == 6 {
+@@ -92,7 +95,7 @@ func DefaultTailscaledStateDir() string {
+ // when it's absent.
+ func MakeAutomaticStateDir() bool {
+ 	switch runtime.GOOS {
+-	case "plan9":
++	case "plan9", "haiku":
+ 		return true
+ 	case "linux":
+ 		if distro.Get() == distro.JetKVM {
+diff --git a/paths/paths_unix.go b/paths/paths_unix.go
+index b1556b2..cce7038 100644
+--- a/paths/paths_unix.go
++++ b/paths/paths_unix.go
+@@ -11,7 +11,6 @@
+ 	"path/filepath"
+ 	"runtime"
+ 
+-	"golang.org/x/sys/unix"
+ 	"tailscale.com/version/distro"
+ )
+ 
+@@ -33,6 +32,8 @@ func statePath() string {
+ 		return "/Library/Tailscale/tailscaled.state"
+ 	case "aix":
+ 		return "/var/tailscale/tailscaled.state"
++	case "haiku":
++		return "/boot/home/config/settings/tailscale/tailscaled.state"
+ 	default:
+ 		return ""
+ 	}
+@@ -49,7 +50,7 @@ func stateFileUnix() string {
+ 
+ 	try := path
+ 	for range 3 { // check writability of the file, /var/lib/tailscale, and /var/lib
+-		err := unix.Access(try, unix.O_RDWR)
++		err := accessReadWrite(try)
+ 		if err == nil {
+ 			return path
+ 		}
+diff --git a/safesocket/unixsocket.go b/safesocket/unixsocket.go
+index 6fe3883..6720420 100644
+--- a/safesocket/unixsocket.go
++++ b/safesocket/unixsocket.go
+@@ -17,8 +17,15 @@
+ )
+ 
+ func connect(ctx context.Context, path string) (net.Conn, error) {
++	if runtime.GOOS == "haiku" {
++		log.Printf("Haiku LocalAPI client: dialing %q", path)
++	}
+ 	var std net.Dialer
+-	return std.DialContext(ctx, "unix", path)
++	c, err := std.DialContext(ctx, "unix", path)
++	if runtime.GOOS == "haiku" {
++		log.Printf("Haiku LocalAPI client: dial completed (err=%v)", err)
++	}
++	return c, err
+ }
+ 
+ func listen(path string) (net.Listener, error) {
+diff --git a/util/prompt/prompt.go b/util/prompt/prompt.go
+index b84993a..810343e 100644
+--- a/util/prompt/prompt.go
++++ b/util/prompt/prompt.go
+@@ -8,8 +8,6 @@
+ 	"fmt"
+ 	"os"
+ 	"strings"
+-
+-	"github.com/mattn/go-isatty"
+ )
+ 
+ // YesNo takes a question and prompts the user to answer the
+@@ -18,7 +16,7 @@
+ // If there is no TTY on both Stdin and Stdout, assume that we're in a script
+ // and return the dflt result.
+ func YesNo(msg string, dflt bool) bool {
+-	if !(isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stdout.Fd())) {
++	if !(isTerminal(os.Stdin.Fd()) && isTerminal(os.Stdout.Fd())) {
+ 		return dflt
+ 	}
+ 	if dflt {
+diff --git a/util/prompt/terminal_haiku.go b/util/prompt/terminal_haiku.go
+new file mode 100644
+index 0000000..d97fd88
+--- /dev/null
++++ b/util/prompt/terminal_haiku.go
+@@ -0,0 +1,10 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package prompt
++
++// go-isatty does not support Haiku. Treat prompts as non-interactive; callers
++// still accept explicit flags and auth keys normally.
++func isTerminal(uintptr) bool { return false }
+diff --git a/util/prompt/terminal_other.go b/util/prompt/terminal_other.go
+new file mode 100644
+index 0000000..27d4684
+--- /dev/null
++++ b/util/prompt/terminal_other.go
+@@ -0,0 +1,10 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !haiku
++
++package prompt
++
++import "github.com/mattn/go-isatty"
++
++func isTerminal(fd uintptr) bool { return isatty.IsTerminal(fd) }
+diff --git a/wgengine/magicsock/derp.go b/wgengine/magicsock/derp.go
+index 72c75db..733595e 100644
+--- a/wgengine/magicsock/derp.go
++++ b/wgengine/magicsock/derp.go
+@@ -12,6 +12,7 @@
+ 	"net"
+ 	"net/netip"
+ 	"reflect"
++	"runtime"
+ 	"slices"
+ 	"time"
+ 	"unsafe"
+@@ -250,21 +251,23 @@ func (c *Conn) setHomeDERPGaugeLocked(derpNum int) {
+ // c.mu must NOT be held.
+ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
+ 	c.mu.Lock()
+-	defer c.mu.Unlock()
+ 	if !c.wantDerpLocked() {
+ 		c.myDerp = 0
+ 		c.setHomeDERPGaugeLocked(0)
+ 		c.health.SetMagicSockDERPHome(0, c.homeless)
++		c.mu.Unlock()
+ 		return false
+ 	}
+ 	if c.homeless {
+ 		c.myDerp = 0
+ 		c.setHomeDERPGaugeLocked(0)
+ 		c.health.SetMagicSockDERPHome(0, c.homeless)
++		c.mu.Unlock()
+ 		return false
+ 	}
+ 	if derpNum == c.myDerp {
+ 		// No change.
++		c.mu.Unlock()
+ 		return true
+ 	}
+ 	if c.myDerp != 0 && derpNum != 0 {
+@@ -277,6 +280,7 @@ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
+ 	if c.privateKey.IsZero() {
+ 		// No private key yet, so DERP connections won't come up anyway.
+ 		// Return early rather than ultimately log a couple lines of noise.
++		c.mu.Unlock()
+ 		return true
+ 	}
+ 
+@@ -288,10 +292,32 @@ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
+ 	} else {
+ 		c.logf("magicsock: home is now derp-%v (%v)", derpNum, c.derpMap.Regions[derpNum].RegionCode)
+ 	}
++	type preferredUpdate struct {
++		client    *derphttp.Client
++		preferred bool
++	}
++	var preferredAfterUnlock []preferredUpdate
+ 	for i, ad := range c.activeDerp {
+-		go ad.c.NotePreferred(i == c.myDerp)
++		preferred := i == c.myDerp
++		if runtime.GOOS == "haiku" {
++			preferredAfterUnlock = append(preferredAfterUnlock, preferredUpdate{ad.c, preferred})
++		} else {
++			go ad.c.NotePreferred(preferred)
++		}
++	}
++	if runtime.GOOS != "haiku" {
++		c.goDerpConnect(derpNum)
++	}
++	c.mu.Unlock()
++	if runtime.GOOS == "haiku" {
++		// Avoid starting a goroutine that immediately waits on c.mu while
++		// its creator still owns that mutex. The experimental Haiku/386
++		// scheduler can otherwise strand the owner and deadlock startup.
++		for _, update := range preferredAfterUnlock {
++			go update.client.NotePreferred(update.preferred)
++		}
++		c.goDerpConnect(derpNum)
+ 	}
+-	c.goDerpConnect(derpNum)
+ 	return true
+ }
+ 
+@@ -787,6 +813,9 @@ func (c *Conn) SendDERPPacketTo(dstKey key.NodePublic, regionID int, pkt []byte)
+ // to only using TCP port 443 outbound. If true, no UDP is allowed,
+ // no STUN checks are performend, etc.
+ func (c *Conn) SetOnlyTCP443(v bool) {
++	if runtime.GOOS == "haiku" {
++		v = true
++	}
+ 	c.onlyTCP443.Store(v)
+ }
+ 
+diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
+index e9fd2b3..d60011a 100644
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -600,6 +600,9 @@ func newConn(logf logger.Logf) *Conn {
+ 	}}
+ 	c.muCond = sync.NewCond(&c.mu)
+ 	c.networkUp.Store(true) // assume up until told otherwise
++	if runtime.GOOS == "haiku" {
++		c.onlyTCP443.Store(true)
++	}
+ 	return c
+ }
+ 
+@@ -1033,20 +1036,50 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
+ 		return new(netcheck.Report), nil
+ 	}
+ 
+-	report, err := c.netChecker.GetReport(ctx, dm, &netcheck.GetReportOpts{
+-		// Pass information about the last time that we received a
+-		// frame from a DERP server to our netchecker to help avoid
+-		// flapping the home region while there's still active
+-		// communication.
+-		//
+-		// NOTE(andrew-d): I don't love that we're depending on the
+-		// health package here, but I'd rather do that and not store
+-		// the exact same state in two different places.
+-		GetLastDERPActivity: c.health.GetDERPRegionReceivedTime,
+-		OnlyTCP443:          c.onlyTCP443.Load(),
+-	})
+-	if err != nil {
+-		return nil, err
++	var report *netcheck.Report
++	if runtime.GOOS == "haiku" {
++		// Haiku/386 currently uses blocking sockets because its Go runtime
++		// netpoller is unavailable. A full netcheck fans out UDP, HTTPS, and
++		// ICMP probes across every DERP region, consuming OS threads and
++		// causing a high-CPU retry storm. Operate in DERP-only mode and pick a
++		// stable relay without probing. Prefer Tokyo when present because the
++		// native x86 port is currently tested in that region.
++		preferredDERP := 0
++		for id, region := range dm.Regions {
++			if region.RegionCode == "tok" && !region.Avoid {
++				preferredDERP = id
++				break
++			}
++		}
++		if preferredDERP == 0 {
++			preferredDERP = c.pickDERPFallback()
++		}
++		c.logf("magicsock: Haiku netcheck disabled; using DERP-only mode with derp-%d", preferredDERP)
++		report = &netcheck.Report{
++			Now:             time.Now(),
++			IPv4:            true,
++			IPv4CanSend:     true,
++			PreferredDERP:   preferredDERP,
++			RegionLatency:   map[int]time.Duration{preferredDERP: 0},
++			RegionV4Latency: map[int]time.Duration{preferredDERP: 0},
++		}
++	} else {
++		var err error
++		report, err = c.netChecker.GetReport(ctx, dm, &netcheck.GetReportOpts{
++			// Pass information about the last time that we received a
++			// frame from a DERP server to our netchecker to help avoid
++			// flapping the home region while there's still active
++			// communication.
++			//
++			// NOTE(andrew-d): I don't love that we're depending on the
++			// health package here, but I'd rather do that and not store
++			// the exact same state in two different places.
++			GetLastDERPActivity: c.health.GetDERPRegionReceivedTime,
++			OnlyTCP443:          c.onlyTCP443.Load(),
++		})
++		if err != nil {
++			return nil, err
++		}
+ 	}
+ 
+ 	c.lastNetCheckReport.Store(report)
+@@ -2751,12 +2784,14 @@ func (c *Conn) SetPreferredPort(port uint16) {
+ // recreated when needed.
+ func (c *Conn) SetPrivateKey(privateKey key.NodePrivate) error {
+ 	c.mu.Lock()
+-	defer c.mu.Unlock()
+ 
+ 	oldKey, newKey := c.privateKey, privateKey
+ 	if newKey.Equal(oldKey) {
++		c.mu.Unlock()
+ 		return nil
+ 	}
++	restunAfterUnlock := false
++	derpReconnectAfterUnlock := 0
+ 	c.privateKey = newKey
+ 	c.havePrivateKey.Store(!newKey.IsZero())
+ 
+@@ -2769,7 +2804,15 @@ func (c *Conn) SetPrivateKey(privateKey key.NodePrivate) error {
+ 	if oldKey.IsZero() {
+ 		c.everHadKey = true
+ 		c.logf("magicsock: SetPrivateKey called (init)")
+-		go c.ReSTUN("set-private-key")
++		if runtime.GOOS == "haiku" {
++			// The experimental Haiku/386 runtime can strand the goroutine
++			// that owns c.mu if a newly started goroutine immediately blocks
++			// trying to acquire the same mutex. Start ReSTUN only after the
++			// owner has released c.mu.
++			restunAfterUnlock = true
++		} else {
++			go c.ReSTUN("set-private-key")
++		}
+ 	} else if newKey.IsZero() {
+ 		c.logf("magicsock: SetPrivateKey called (zeroed)")
+ 		c.closeAllDerpLocked("zero-private-key")
+@@ -2783,7 +2826,11 @@ func (c *Conn) SetPrivateKey(privateKey key.NodePrivate) error {
+ 	// Key changed. Close existing DERP connections and reconnect to home.
+ 	if c.myDerp != 0 && !newKey.IsZero() {
+ 		c.logf("magicsock: private key changed, reconnecting to home derp-%d", c.myDerp)
+-		c.startDerpHomeConnectLocked()
++		if runtime.GOOS == "haiku" {
++			derpReconnectAfterUnlock = c.myDerp
++		} else {
++			c.startDerpHomeConnectLocked()
++		}
+ 	}
+ 
+ 	if newKey.IsZero() {
+@@ -2792,6 +2839,13 @@ func (c *Conn) SetPrivateKey(privateKey key.NodePrivate) error {
+ 		})
+ 	}
+ 
++	c.mu.Unlock()
++	if restunAfterUnlock {
++		go c.ReSTUN("set-private-key")
++	}
++	if derpReconnectAfterUnlock != 0 {
++		c.goDerpConnect(derpReconnectAfterUnlock)
++	}
+ 	return nil
+ }
+ 
+@@ -3489,7 +3543,10 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error)
+ 	}
+ 	c.closed = false
+ 	fns := []conn.ReceiveFunc{c.receiveIPv4(), c.receiveIPv6(), c.receiveDERP}
+-	if runtime.GOOS == "js" {
++	if runtime.GOOS == "js" || runtime.GOOS == "haiku" {
++		// Haiku/386 runs in DERP-only mode while runtime netpoll is
++		// unavailable. Starting blocking UDP receive functions here consumes
++		// the OS threads needed by LocalAPI and control connections.
+ 		fns = []conn.ReceiveFunc{c.receiveDERP}
+ 	}
+ 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
+diff --git a/wgengine/netstack/netstack.go b/wgengine/netstack/netstack.go
+index 1ed42df..b3345fd 100644
+--- a/wgengine/netstack/netstack.go
++++ b/wgengine/netstack/netstack.go
+@@ -349,10 +349,16 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
+ 	if dialer == nil {
+ 		return nil, errors.New("nil Dialer")
+ 	}
++	if runtime.GOOS == "haiku" {
++		logf("Haiku netstack: initializing gVisor stack")
++	}
+ 	ipstack := stack.New(stack.Options{
+ 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+ 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
+ 	})
++	if runtime.GOOS == "haiku" {
++		logf("Haiku netstack: gVisor stack initialized")
++	}
+ 	sackEnabledOpt := tcpip.TCPSACKEnabled(true) // TCP SACK is disabled by default
+ 	tcpipErr := ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt)
+ 	if tcpipErr != nil {
+@@ -393,6 +399,9 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
+ 	if tcpipProblem := ipstack.CreateNIC(nicID, linkEP); tcpipProblem != nil {
+ 		return nil, fmt.Errorf("could not create netstack NIC: %v", tcpipProblem)
+ 	}
++	if runtime.GOOS == "haiku" {
++		logf("Haiku netstack: NIC created")
++	}
+ 	// By default the netstack NIC will only accept packets for the IPs
+ 	// registered to it. Since in some cases we dynamically register IPs
+ 	// based on the packets that arrive, the NIC needs to accept all

@@ -1,0 +1,78 @@
+Make Haiku/386 sockets non-blocking and register them with the netpoller.
+
+The base patch deliberately kept sockets blocking and out of the runtime
+poller, from when the port had no working netpoller. go-haiku386-netpoll.patch
+fixed the netpoller but never undid these three spots, so sockets stayed
+blocking and the poller went unused for them.
+
+The cost is not just lost parallelism: a read blocked in the kernel cannot be
+interrupted by SetReadDeadline, so every socket deadline in the tree silently
+does nothing. A DERP reader with a 120s Recv timeout was caught wedged
+forever in syscall.read, which is what made ssh through the tailnet hang.
+
+SOCK_NONBLOCK is passed to socket()/accept4() rather than doing a follow-up
+fcntl, because this port cannot safely call the variadic fcntl.
+
+--- a/src/net/sock_cloexec.go
++++ b/src/net/sock_cloexec.go
+@@ -11,21 +11,13 @@
+ 
+ import (
+ 	"os"
+-	"runtime"
+ 	"syscall"
+ )
+ 
+ // Wrapper around the socket system call that marks the returned file
+ // descriptor as nonblocking and close-on-exec.
+ func sysSocket(family, sotype, proto int) (int, error) {
+-	flags := syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC
+-	if runtime.GOOS == "haiku" {
+-		// The experimental 386 port cannot currently receive readiness
+-		// notifications from Haiku's poll function. Keep sockets blocking so
+-		// I/O completes in the syscall instead of waiting on the netpoller.
+-		flags = syscall.SOCK_CLOEXEC
+-	}
+-	s, err := socketFunc(family, sotype|flags, proto)
++	s, err := socketFunc(family, sotype|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, proto)
+ 	if err != nil {
+ 		return -1, os.NewSyscallError("socket", err)
+ 	}
+--- a/src/internal/poll/sock_cloexec.go
++++ b/src/internal/poll/sock_cloexec.go
+@@ -9,19 +9,12 @@
+ 
+ package poll
+ 
+-import (
+-	"runtime"
+-	"syscall"
+-)
++import "syscall"
+ 
+ // Wrapper around the accept system call that marks the returned file
+ // descriptor as nonblocking and close-on-exec.
+ func accept(s int) (int, syscall.Sockaddr, string, error) {
+-	flags := syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC
+-	if runtime.GOOS == "haiku" {
+-		flags = syscall.SOCK_CLOEXEC
+-	}
+-	ns, sa, err := Accept4Func(s, flags)
++	ns, sa, err := Accept4Func(s, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
+ 	if err != nil {
+ 		return -1, nil, "accept4", err
+ 	}
+--- a/src/net/fd_unix.go
++++ b/src/net/fd_unix.go
+@@ -38,10 +38,7 @@
+ }
+ 
+ func (fd *netFD) init() error {
+-	// The experimental Haiku/386 runtime cannot currently deliver poll
+-	// readiness events. Haiku sockets are created in blocking mode, so keep
+-	// them out of the runtime poller as well.
+-	return fd.pfd.Init(fd.net, runtime.GOOS != "haiku")
++	return fd.pfd.Init(fd.net, true)
+ }
+ 
+ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa syscall.Sockaddr, ret error) {

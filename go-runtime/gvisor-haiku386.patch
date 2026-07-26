@@ -1,0 +1,15 @@
+diff --git a/pkg/tcpip/network/ipv4/ipv4.go b/pkg/tcpip/network/ipv4/ipv4.go
+--- a/pkg/tcpip/network/ipv4/ipv4.go
++++ b/pkg/tcpip/network/ipv4/ipv4.go
+@@ -57,7 +57,10 @@ const (
+ 	DefaultTTL = 64
+ 
+ 	// buckets is the number of identifier buckets.
+-	buckets = 2048
++	// Keep this small for the 32-bit Haiku port. Initializing the upstream
++	// value consumes more than 8 KiB from getentropy, whose Haiku interface
++	// is limited to 256 bytes per call.
++	buckets = 64
+ 
+ 	// The size of a fragment block, in bytes, as per RFC 791 section 3.1,
+ 	// page 14.

@@ -1,0 +1,113 @@
+Pass mmap's 64-bit off_t correctly by widening the libc argument window.
+
+Haiku's mmap takes off_t (int64) as its sixth argument, which is two stack
+words in the 32-bit cdecl ABI - seven words in total. doMmap passed six, so
+the high half of the offset was whatever asmsysvicall6 happened to leave
+above its argument block. This is the same defect class as the osyield/snooze
+bug, but latent: the runtime only creates anonymous mappings, where the
+offset is ignored.
+
+asmsysvicall6 copies a fixed number of words regardless of libcall.n, so the
+caller alone cannot fix it. The window is now eight words. Callers passing
+fewer are unaffected - the callee reads only the arguments it declares, and
+this already copied more words than most callers supply.
+
+Verified on hardware: lockstress 20/20 clean, tailscaled ready 4 of 4 in 1s
+each, up to Running in 4s, and ssh through the tailnet 4 of 4 on the first
+attempt.
+
+--- a/src/runtime/sys_haiku_386.s
++++ b/src/runtime/sys_haiku_386.s
+@@ -42,49 +42,6 @@
+ 	MOVL	info+8(FP), CX
+ 	MOVL	ctx+12(FP), DX
+ 	MOVL	SP, SI
+-	SUBL	$24, SP
+-	ANDL	$~15, SP
+-	MOVL	BX, 0(SP)
+-	MOVL	CX, 4(SP)
+-	MOVL	DX, 8(SP)
+-	MOVL	SI, 12(SP)
+-	CALL	AX
+-	MOVL	12(SP), AX
+-	MOVL	AX, SP
+-	RET
+-
+-// Runs on the OS stack, called from runtime.osyield.
+-TEXT runtime·osyield1(SB),NOSPLIT,$0
+-	SUBL	$8, SP
+-	MOVL	$0, 0(SP)
+-	MOVL	$0, 4(SP)
+-	MOVL	$libc_snooze(SB), AX
+-	CALL	AX
+-	ADDL	$8, SP
+-	RET
+-
+-// Call a libroot function using the 32-bit SysV cdecl ABI.
+-// Called through asmcgocall with *libcall at 4(SP).
+-TEXT runtime·asmsysvicall6(SB),NOSPLIT,$0
+-	PUSHL	BP
+-	PUSHL	BX
+-	PUSHL	SI
+-	PUSHL	DI
+-	MOVL	20(SP), DI
+-	MOVL	libcall_fn(DI), AX
+-	MOVL	libcall_args(DI), SI
+-
+-	get_tls(CX)
+-	MOVL	g(CX), BX
+-	CMPL	BX, $0
+-	JEQ	args
+-	MOVL	g_m(BX), BX
+-	MOVL	(m_mOS+mOS_perrno)(BX), DX
+-	CMPL	DX, $0
+-	JEQ	args
+-	MOVL	$0, 0(DX)
+-
+-args:
+ 	SUBL	$32, SP
+ 	ANDL	$~15, SP
+ 	MOVL	BX, 0(SP)
+@@ -149,9 +106,13 @@
+ 	MOVL	CX, 16(SP)
+ 	MOVL	20(SI), CX
+ 	MOVL	CX, 20(SP)
++	MOVL	24(SI), CX
++	MOVL	CX, 24(SP)
++	MOVL	28(SI), CX
++	MOVL	CX, 28(SP)
+ call:
+ 	CALL	AX
+-	ADDL	$24, SP
++	ADDL	$32, SP
+ 	MOVL	AX, libcall_r1(DI)
+ 	MOVL	DX, libcall_r2(DI)
+ 
+--- a/src/runtime/os2_haiku.go
++++ b/src/runtime/os2_haiku.go
+@@ -441,7 +441,11 @@
+ 
+ //go:nosplit
+ func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (unsafe.Pointer, int) {
+-	p, err := doMmap(uintptr(addr), n, uintptr(prot), uintptr(flags), uintptr(fd), uintptr(off))
++	// off is passed as two words: Haiku's mmap takes a 64-bit off_t, which is
++	// two stack words in this ABI. Passing one word left the high half as stack
++	// garbage - harmless so far only because the runtime maps anonymously, where
++	// the offset is ignored.
++	p, err := doMmap(uintptr(addr), n, uintptr(prot), uintptr(flags), uintptr(fd), uintptr(off), 0)
+ 	if p == ^uintptr(0) {
+ 		return nil, int(err)
+ 	}
+@@ -450,10 +454,10 @@
+ 
+ //go:nosplit
+ //go:cgo_unsafe_args
+-func doMmap(addr, n, prot, flags, fd, off uintptr) (uintptr, uintptr) {
++func doMmap(addr, n, prot, flags, fd, offLo, offHi uintptr) (uintptr, uintptr) {
+ 	var libcall libcall
+ 	libcall.fn = uintptr(unsafe.Pointer(&libc_mmap))
+-	libcall.n = 6
++	libcall.n = 7
+ 	libcall.args = uintptr(noescape(unsafe.Pointer(&addr)))
+ 	asmcgocall(unsafe.Pointer(&asmsysvicall6x), unsafe.Pointer(&libcall))
+ 	return libcall.r1, libcall.err

@@ -7,6 +7,7 @@ Nothing here is a fork. It is a patch you apply to an unmodified
 `tailscale/tailscale` checkout, plus the build scripts and the Go toolchain
 patches, so you can see exactly what was changed and why.
 
+한국어 문서: [README.ko.md](README.ko.md).
 Korean version of this document: [README.ko.md](README.ko.md).
 
 ## Layout

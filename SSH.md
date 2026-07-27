@@ -1,8 +1,8 @@
-# SSH to a tailnet host from Haiku
+# SSH to a tailnet host from HaikuOS
 
-On Haiku, `tailscaled` runs in **userspace networking** mode. There is no TUN
+On HaikuOS, `tailscaled` runs in **userspace networking** mode. There is no TUN
 device, so it does not route the operating system's traffic: a plain
-`ssh myserver` from Haiku goes out over your normal network and never touches
+`ssh myserver` from HaikuOS goes out over your normal network and never touches
 the tailnet. Only programs that go *through* tailscaled reach tailnet addresses.
 
 The way through is `tailscale nc` as ssh's `ProxyCommand`. ssh talks to its
@@ -56,7 +56,7 @@ Four details in there are not cosmetic:
 
 ## Use addresses, not names
 
-MagicDNS is not wired into Haiku's resolver, and `tailscale nc` resolves through
+MagicDNS is not wired into HaikuOS's resolver, and `tailscale nc` resolves through
 the daemon, which does not know your workstation's `/etc/hosts` aliases. Use the
 tailnet IP (`100.x.y.z`), or an address covered by a route that a subnet router
 advertises. A name that only exists locally comes back as `502 Bad Gateway` with
@@ -79,7 +79,7 @@ key=${TS_SSH_KEY:-$HOME/.ssh/id_ed25519}
 bin=${TS_BIN:-tailscale}
 sock=${TS_SOCKET:-$HOME/config/settings/tailscale/tailscaled.sock}
 
-# Reap leftover `tailscale nc` processes. Haiku has no pkill, and `ps ax` hides
+# Reap leftover `tailscale nc` processes. HaikuOS has no pkill, and `ps ax` hides
 # these teams, so parse plain `ps` and kill by team id - the 4th field from the
 # end of the line. This matters: a failed attempt can leave one behind, each
 # leftover burns about a fifth of a core, and a few of them starve the daemon

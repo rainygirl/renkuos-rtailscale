@@ -1,6 +1,6 @@
-# Haiku에서 tailnet 호스트에 SSH 접속하기
+# HaikuOS에서 tailnet 호스트에 SSH 접속하기
 
-Haiku에서 `tailscaled`는 **userspace networking** 모드로 동작합니다. TUN 장치가 없으므로 운영체제의 트래픽을 라우팅하지 않습니다. 즉 Haiku에서 그냥 `ssh myserver`를 실행하면 평소 네트워크로 나갈 뿐 tailnet에는 닿지 않습니다. tailscaled를 *거쳐 가는* 프로그램만 tailnet 주소에 도달합니다.
+HaikuOS에서 `tailscaled`는 **userspace networking** 모드로 동작합니다. TUN 장치가 없으므로 운영체제의 트래픽을 라우팅하지 않습니다. 즉 HaikuOS에서 그냥 `ssh myserver`를 실행하면 평소 네트워크로 나갈 뿐 tailnet에는 닿지 않습니다. tailscaled를 *거쳐 가는* 프로그램만 tailnet 주소에 도달합니다.
 
 통로는 ssh의 `ProxyCommand`로 쓰는 `tailscale nc`입니다. ssh는 자신의 stdin/stdout으로 대화하고, `tailscale nc`가 데몬의 다이얼러로 목적지에 연결하며, 연결은 tailnet을 타고 갑니다. 이 포트가 쓰는 유일한 데이터 경로인 DERP를 경유합니다.
 
@@ -40,7 +40,7 @@ ssh -o ProxyCommand="env GOMAXPROCS=1 GODEBUG=asyncpreemptoff=1 \
 
 ## 이름 대신 주소를 쓰세요
 
-MagicDNS는 Haiku의 리졸버에 연결돼 있지 않고, `tailscale nc`는 데몬을 통해 이름을 해석하는데 데몬은 당신 워크스테이션의 `/etc/hosts` 별칭을 모릅니다. tailnet IP(`100.x.y.z`)나 서브넷 라우터가 광고하는 경로에 포함된 주소를 쓰세요. 로컬에만 있는 이름은 `502 Bad Gateway`와 `no such host`로 돌아옵니다.
+MagicDNS는 HaikuOS의 리졸버에 연결돼 있지 않고, `tailscale nc`는 데몬을 통해 이름을 해석하는데 데몬은 당신 워크스테이션의 `/etc/hosts` 별칭을 모릅니다. tailnet IP(`100.x.y.z`)나 서브넷 라우터가 광고하는 경로에 포함된 주소를 쓰세요. 로컬에만 있는 이름은 `502 Bad Gateway`와 `no such host`로 돌아옵니다.
 
 `tailscale status`로 노드가 아는 주소를 확인할 수 있습니다.
 
@@ -58,7 +58,7 @@ key=${TS_SSH_KEY:-$HOME/.ssh/id_ed25519}
 bin=${TS_BIN:-tailscale}
 sock=${TS_SOCKET:-$HOME/config/settings/tailscale/tailscaled.sock}
 
-# 남은 `tailscale nc` 프로세스를 수거합니다. Haiku에는 pkill이 없고 `ps ax`는
+# 남은 `tailscale nc` 프로세스를 수거합니다. HaikuOS에는 pkill이 없고 `ps ax`는
 # 이 team들을 숨기므로, 평범한 `ps`를 파싱해 team id(줄 끝에서 4번째 필드)로
 # 죽입니다. 중요합니다. 실패한 시도는 프로세스를 남길 수 있고, 하나당 코어의
 # 약 1/5을 소모하며, 몇 개만 쌓여도 데몬이 굶어 아무것도 연결되지 않습니다.

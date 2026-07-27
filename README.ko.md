@@ -1,6 +1,6 @@
-# HaikuOS(32비트 x86)용 Tailscale
+# Haiku(32비트 x86)용 Tailscale
 
-HaikuOS/x86(`haiku/386`)에서 Tailscale을 네이티브로 빌드·실행하기 위한 패치 모음입니다. 포트에 필요한 Go 런타임 수정도 함께 들어 있습니다.
+Haiku/x86(`haiku/386`)에서 Tailscale을 네이티브로 빌드·실행하기 위한 패치 모음입니다. 포트에 필요한 Go 런타임 수정도 함께 들어 있습니다.
 
 포크가 아닙니다. 수정하지 않은 `tailscale/tailscale` 체크아웃에 적용하는 패치와, 빌드 스크립트, Go 툴체인 패치로 구성돼 있어 무엇을 왜 바꿨는지 그대로 확인할 수 있습니다.
 
@@ -9,33 +9,33 @@ HaikuOS/x86(`haiku/386`)에서 Tailscale을 네이티브로 빌드·실행하기
 ## 구성
 
 ```
-install.sh               Linux/macOS에서 크로스 빌드, HaikuOS에서 설치
+install.sh               Linux/macOS에서 크로스 빌드, Haiku에서 설치
 apply.sh                 tailscale 체크아웃에 포트 적용
 patches/                 tailscale 소스 변경분
 go-runtime/              Go 툴체인 변경분 (gvisor, wireguard-go 포함)
 build/                   build.sh, Makefile - haiku/386 빌드
 scripts/                 run-native.sh (런처)
 testdata/                lockstress.go - 스케줄러 hang 재현기
-SSH.md                   HaikuOS에서 tailnet 호스트에 접속하기 (영문)
+SSH.md                   Haiku에서 tailnet 호스트에 접속하기 (영문)
 SSH.ko.md                같은 문서의 한국어판
 ```
 
 ## 빌드는 어디서 해야 하나
 
-**HaikuOS 머신에서는 빌드할 수 없습니다.** Linux나 macOS에서 빌드해 바이너리를 옮겨야 합니다.
+**Haiku 머신에서는 빌드할 수 없습니다.** Linux나 macOS에서 빌드해 바이너리를 옮겨야 합니다.
 
 - Go 컴파일러는 Go로 작성돼 있어, 빌드하려면 이미 동작하는 Go가 필요합니다.
-- 32비트 HaikuOS에는 출발점이 될 Go가 없습니다. `pkgman`에 x86_32용 `go` 패키지가 없습니다.
-- 보통의 우회책인 "타깃에서 도는 툴체인을 크로스 빌드하기"(Go의 `src/bootstrap.bash`)도 여기서는 실패합니다. `cmd/vendor/golang.org/x/sys/unix`에 HaikuOS 지원이 없어 컴파일이 멈춥니다.
+- 32비트 Haiku에는 출발점이 될 Go가 없습니다. `pkgman`에 x86_32용 `go` 패키지가 없습니다.
+- 보통의 우회책인 "타깃에서 도는 툴체인을 크로스 빌드하기"(Go의 `src/bootstrap.bash`)도 여기서는 실패합니다. `cmd/vendor/golang.org/x/sys/unix`에 Haiku 지원이 없어 컴파일이 멈춥니다.
 
   ```
   x/sys/unix/fdset.go:15:12: undefined: FdSet
   x/sys/unix/ioctl_unsigned.go:34:47: undefined: Winsize
   ```
 
-  `x/sys/unix`를 HaikuOS로 포팅하면 이 문제가 풀리고 기기 내 빌드가 가능해집니다. 다만 별개의 작업이며 이 포트의 범위가 아닙니다.
+  `x/sys/unix`를 Haiku로 포팅하면 이 문제가 풀리고 기기 내 빌드가 가능해집니다. 다만 별개의 작업이며 이 포트의 범위가 아닙니다.
 
-혹시 HaikuOS 박스에 동작하는 Go가 있다면 `install.sh`가 그것을 사용합니다. `GO_BOOTSTRAP=/path/to/go`를 넘기면 그 자리에서 빌드합니다.
+혹시 Haiku 박스에 동작하는 Go가 있다면 `install.sh`가 그것을 사용합니다. `GO_BOOTSTRAP=/path/to/go`를 넘기면 그 자리에서 빌드합니다.
 
 빌드 호스트에는 Go가 **설치돼 있지 않아도 됩니다.** tailscale의 `tool/go`가 부트스트랩 툴체인을 알아서 내려받습니다.
 
@@ -50,7 +50,7 @@ scp tailscale-haiku386.tar.gz user@haiku-box:
 
 지정된 버전의 tailscale을 clone하고, 포트를 적용하고, 패치된 Go 툴체인과 `haiku/386` 바이너리를 빌드해 아카이브를 만듭니다. Go 툴체인을 컴파일하므로 수 분 걸립니다.
 
-그다음 HaikuOS 머신에서:
+그다음 Haiku 머신에서:
 
 ```sh
 ./install.sh --prebuilt tailscale-haiku386.tar.gz
@@ -89,7 +89,7 @@ cd tailscale && git checkout v1.101.0
 | --- | --- |
 | `go-haiku386.patch` | 기반 포트 (`build.sh`가 별도로 받아옴) |
 | `go-haiku386-netpoll.patch` | 동작하는 `poll(2)` netpoller. accept/connect/read/write readiness 전달, `poll()` 호출 중 락 미보유 |
-| `go-haiku386-preempt.patch` | 비동기 선점. HaikuOS의 시그널 래퍼는 레지스터 집합을 `ucontext` 포인터가 아니라 스택에 인라인으로 전달하므로, 기본 `sigtramp`가 쓰레기값을 읽었음 |
+| `go-haiku386-preempt.patch` | 비동기 선점. Haiku의 시그널 래퍼는 레지스터 집합을 `ucontext` 포인터가 아니라 스택에 인라인으로 전달하므로, 기본 `sigtramp`가 쓰레기값을 읽었음 |
 | `go-haiku386-sockets.patch` | 소켓을 netpoller에 등록. 이것이 없으면 트리 안의 모든 소켓 데드라인이 조용히 무효였음 |
 | `go-haiku386-osyield.patch` | **startup hang.** `osyield()`가 `snooze()`의 64비트 `bigtime_t`를 32비트 워드 하나로 전달해 상위 절반이 스택 쓰레기값이 됐고, 그 "yield"가 사실상 영원히 잠들 수 있었음. 그것도 `lock2`의 스핀 단계에서 P를 쥔 채로 |
 | `go-haiku386-mmap.patch` | `mmap`의 `off_t`에 있는 같은 종류의 결함. 런타임이 익명 매핑만 쓰므로 잠재적 |
@@ -104,7 +104,7 @@ cd tailscale && git checkout v1.101.0
 
 ## tailscale 패치가 하는 일
 
-데몬과 CLI 전반의 HaikuOS 지원입니다. 플랫폼 파일(`paths`, `safesocket`, `util/prompt`, `net/tstun`), LocalAPI 서버·클라이언트의 HaikuOS 전용 처리, DERP 및 control-plane 타임아웃, TUN 장치 없이 동작하는 userspace-networking 구성. 자세한 내용은 `apply.sh`가 설치하는 `haiku32/README.md`에 있습니다.
+데몬과 CLI 전반의 Haiku 지원입니다. 플랫폼 파일(`paths`, `safesocket`, `util/prompt`, `net/tstun`), LocalAPI 서버·클라이언트의 Haiku 전용 처리, DERP 및 control-plane 타임아웃, TUN 장치 없이 동작하는 userspace-networking 구성. 자세한 내용은 `apply.sh`가 설치하는 `haiku32/README.md`에 있습니다.
 
 알려진 문제:
 

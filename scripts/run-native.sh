@@ -54,17 +54,18 @@ stop_pid()
 # hold the proxy ports. Instead, parse plain `ps` (which DOES show them) and kill
 # each by its team id. In Haiku `ps` output the trailing columns are
 # <team> <threads> <gid> <uid>, so the team id is the 4th field from the end
-# (NF-3), even though the command text contains spaces. The pattern matches both
-# "dist/haiku32/tailscaled" and "dist/haiku32/tailscale" (the CLI), since a
-# wedged `up`/`nc` spins just like a wedged daemon.
+# (NF-3), even though the command text contains spaces. Match by the actual
+# install directory ($script_dir) so this works wherever the binaries live
+# (dist/haiku32 during development, ~/config/non-packaged/bin once installed).
+# It matches the daemon ("<dir>/tailscaled ") and the CLI ("<dir>/tailscale --"),
+# but NOT this launcher ("tailscale-haiku"), since a wedged `up`/`nc` spins just
+# like a wedged daemon.
 kill_all_tailscaled()
 {
 	kill_round=0
 	while [ "$kill_round" -lt 5 ]; do
-		# Match the daemon ("tailscaled ") and the CLI ("tailscale --socket..."),
-		# but NOT this launcher ("tailscale-haiku") or the grep itself.
 		kill_ids=$(ps 2>/dev/null \
-			| grep -E 'dist/haiku32/tailscaled |dist/haiku32/tailscale --' \
+			| grep -E "$script_dir/tailscaled |$script_dir/tailscale --" \
 			| grep -v grep | awk '{print $(NF-3)}')
 		[ -z "$kill_ids" ] && return
 		for kill_id in $kill_ids; do
@@ -152,7 +153,7 @@ while [ "$attempt" -le "$max_attempts" ]; do
 	# DERP connection within ~6s, where the default sits at "connecting to
 	# derp-N" or a control TLS handshake forever with the CPU idle. Single-P
 	# costs some parallelism but this hardware is a 1.33GHz Atom anyway.
-	GOMAXPROCS=1 TS_HAIKU_READY_FILE="$ready_file" TS_HAIKU_DEFER_START=1 "$script_dir/tailscaled" \
+	GOMAXPROCS=1 GODEBUG=asyncpreemptoff=1 TS_HAIKU_READY_FILE="$ready_file" TS_HAIKU_DEFER_START=1 "$script_dir/tailscaled" \
 		--tun=userspace-networking \
 		--socket="$socket" \
 		--state="$state" \
@@ -223,7 +224,7 @@ run_tailscale_cli() {
 	while [ "$k" -le "$cli_attempts" ]; do
 		cli_out=$state_dir/tailscale-cli.out
 		: > "$cli_out"
-		GOMAXPROCS=1 "$script_dir/tailscale" --socket="$socket" "$@" >"$cli_out" 2>&1 &
+		GOMAXPROCS=1 GODEBUG=asyncpreemptoff=1 "$script_dir/tailscale" --socket="$socket" "$@" >"$cli_out" 2>&1 &
 		cli_pid=$!
 		g=0
 		while [ "$g" -lt "$cli_grace" ]; do
@@ -269,7 +270,14 @@ run_tailscale_cli() {
 # recognised a backend that had started - it killed a perfectly healthy `up` and
 # retried, over and over, while the node was already Running.
 count_log() {
-	n=$(grep -ac "$1" "$log_file" 2>/dev/null)
+	# grep -c prints the count ("0") AND exits 1 when there are no matches.
+	# Under `set -e` that non-zero status exits the whole launcher mid-run - the
+	# EXIT trap then kills the daemon and removes its socket, and the now
+	# socketless daemon spins a core (this was the "CPU spike / never reaches
+	# Running" on a fresh boot, where the first count_log always matches nothing).
+	# `|| n=0` swallows the status without appending a second line of output the
+	# way the old `|| echo 0` did (grep already printed the correct "0").
+	n=$(grep -ac "$1" "$log_file" 2>/dev/null) || n=0
 	case $n in
 		''|*[!0-9]*) n=0 ;;
 	esac
@@ -281,7 +289,7 @@ run_up() {
 	j=1
 	while [ "$j" -le "$up_attempts" ]; do
 		before=$(count_log "control: doLogin\|Switching ipn state")
-		GOMAXPROCS=1 "$script_dir/tailscale" --socket="$socket" up "$@" \
+		GOMAXPROCS=1 GODEBUG=asyncpreemptoff=1 "$script_dir/tailscale" --socket="$socket" up "$@" \
 			--accept-dns=false --accept-routes=true \
 			>"$state_dir/tailscale-cli.out" 2>&1 &
 		up_pid=$!
@@ -328,7 +336,7 @@ run_up() {
 		# daemon) so a wedged up stops spinning, then retry.
 		echo "tailscale up did not start the backend (attempt ${j}/${up_attempts}); retrying..." >&2
 		kill -9 "$up_pid" 2>/dev/null || true
-		for cli_id in $(ps 2>/dev/null | grep 'dist/haiku32/tailscale --' \
+		for cli_id in $(ps 2>/dev/null | grep "$script_dir/tailscale --" \
 			| grep -v grep | awk '{print $(NF-3)}'); do
 			case $cli_id in ''|*[!0-9]*) continue ;; esac
 			kill -9 "$cli_id" 2>/dev/null || true
@@ -389,7 +397,7 @@ while [ "$cycle" -le "$cycles" ]; do
 	sleep 3
 	rm -f "$socket" "$ready_file"
 	: > "$log_file"
-	GOMAXPROCS=1 TS_HAIKU_READY_FILE="$ready_file" TS_HAIKU_DEFER_START=1 "$script_dir/tailscaled" \
+	GOMAXPROCS=1 GODEBUG=asyncpreemptoff=1 TS_HAIKU_READY_FILE="$ready_file" TS_HAIKU_DEFER_START=1 "$script_dir/tailscaled" \
 		--tun=userspace-networking \
 		--socket="$socket" \
 		--state="$state" \

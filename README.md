@@ -1,50 +1,49 @@
-# Tailscale on HaikuOS (32-bit x86)
+# Tailscale on Haiku (32-bit x86)
 
-A patch set that builds and runs Tailscale natively on HaikuOS/x86 (`haiku/386`),
+A patch set that builds and runs Tailscale natively on Haiku/x86 (`haiku/386`),
 including the Go runtime fixes the port needs.
 
 Nothing here is a fork. It is a patch you apply to an unmodified
 `tailscale/tailscale` checkout, plus the build scripts and the Go toolchain
 patches, so you can see exactly what was changed and why.
 
-한국어 문서: [README.ko.md](README.ko.md).
 Korean version of this document: [README.ko.md](README.ko.md).
 
 ## Layout
 
 ```
-install.sh               cross-build on Linux/macOS, install on HaikuOS
+install.sh               cross-build on Linux/macOS, install on Haiku
 apply.sh                 apply the port to a tailscale checkout
 patches/                 changes to the tailscale source
 go-runtime/              changes to the Go toolchain (and gvisor, wireguard-go)
 build/                   build.sh, Makefile - build for haiku/386
 scripts/                 run-native.sh (the launcher)
 testdata/                lockstress.go - reproducer for the scheduler hang
-SSH.md                   reaching a tailnet host from HaikuOS
+SSH.md                   reaching a tailnet host from Haiku
 SSH.ko.md                the same, in Korean
 ```
 
 ## Where you have to build
 
-**You cannot build this on the HaikuOS machine.** Build on Linux or macOS and copy
+**You cannot build this on the Haiku machine.** Build on Linux or macOS and copy
 the binaries over. That is not a preference, it is a bootstrap problem:
 
 - The Go compiler is written in Go, so building it needs a working Go first.
-- There is no Go for 32-bit HaikuOS to start from - `pkgman` has no `go` package
+- There is no Go for 32-bit Haiku to start from - `pkgman` has no `go` package
   for x86_32.
 - The usual escape hatch, cross-building a target-native toolchain with Go's
   `src/bootstrap.bash`, does not work here either. It fails while compiling
-  `cmd/vendor/golang.org/x/sys/unix`, which has no HaikuOS support:
+  `cmd/vendor/golang.org/x/sys/unix`, which has no Haiku support:
 
   ```
   x/sys/unix/fdset.go:15:12: undefined: FdSet
   x/sys/unix/ioctl_unsigned.go:34:47: undefined: Winsize
   ```
 
-  Porting `x/sys/unix` to HaikuOS would fix that and make on-device builds
+  Porting `x/sys/unix` to Haiku would fix that and make on-device builds
   possible. It is a separate piece of work and is not part of this port.
 
-If you do somehow have a working Go on the HaikuOS box, `install.sh` will use it:
+If you do somehow have a working Go on the Haiku box, `install.sh` will use it:
 pass `GO_BOOTSTRAP=/path/to/go` and it builds in place.
 
 The build host does **not** need Go installed. Tailscale's own `tool/go`
@@ -63,7 +62,7 @@ That clones tailscale at the pinned version, applies the port, builds the
 patched Go toolchain and the `haiku/386` binaries, and writes the archive.
 Expect several minutes; it compiles a Go toolchain.
 
-Then on the HaikuOS machine:
+Then on the Haiku machine:
 
 ```sh
 ./install.sh --prebuilt tailscale-haiku386.tar.gz
@@ -109,7 +108,7 @@ The base port is korli's `haiku/386` work. On top of it:
 | --- | --- |
 | `go-haiku386.patch` | the base port (fetched separately by `build.sh`) |
 | `go-haiku386-netpoll.patch` | a working `poll(2)` netpoller: readiness for accept/connect/read/write, and no lock held across `poll()` |
-| `go-haiku386-preempt.patch` | async preemption. HaikuOS's signal wrapper passes the register set inline on the stack, not a `ucontext` pointer, so the stock `sigtramp` read garbage |
+| `go-haiku386-preempt.patch` | async preemption. Haiku's signal wrapper passes the register set inline on the stack, not a `ucontext` pointer, so the stock `sigtramp` read garbage |
 | `go-haiku386-sockets.patch` | put sockets on the netpoller at all. Without this every socket deadline in the tree was silently inert |
 | `go-haiku386-osyield.patch` | **the startup hang.** `osyield()` passed `snooze()`'s 64-bit `bigtime_t` as one 32-bit word, so the high half was stack garbage and the "yield" could sleep effectively forever - inside `lock2`'s spin phase, holding a P |
 | `go-haiku386-mmap.patch` | same defect class in `mmap`'s `off_t`; latent, since the runtime only maps anonymously |
@@ -131,8 +130,8 @@ two argument words on 386.** Audit new `sysvicall` calls for it.
 
 ## What the tailscale patch does
 
-HaikuOS support across the daemon and CLI: platform files (`paths`, `safesocket`,
-`util/prompt`, `net/tstun`), HaikuOS-specific handling in the LocalAPI server and
+Haiku support across the daemon and CLI: platform files (`paths`, `safesocket`,
+`util/prompt`, `net/tstun`), Haiku-specific handling in the LocalAPI server and
 client, DERP and control-plane timeouts, and a userspace-networking setup that
 works without a TUN device. `haiku32/README.md` (installed by `apply.sh`) has
 the details.

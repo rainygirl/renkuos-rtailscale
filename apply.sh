@@ -3,7 +3,7 @@
 #
 # Usage:
 #   git clone https://github.com/tailscale/tailscale
-#   cd tailscale && git checkout v1.101.0        # see BASE_VERSION below
+#   cd tailscale && git checkout v1.102.0        # see BASE_VERSION below
 #   /path/to/haiku386-port/apply.sh .
 #
 # What it does:
@@ -18,7 +18,7 @@
 # haiku32/build.sh afterwards, which applies those patches itself.
 set -eu
 
-BASE_VERSION=1.101.0
+BASE_VERSION=1.102.0
 
 usage() {
 	echo "usage: $0 <path-to-tailscale-checkout>" >&2

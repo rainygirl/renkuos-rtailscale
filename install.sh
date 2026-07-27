@@ -33,11 +33,11 @@
 #                    (default: ~/config/non-packaged/bin on Haiku, ./out elsewhere)
 #   --workdir DIR    where to clone and build
 #                    (default: ~/Workspace/haiku-tailscale)
-#   --ref REF        tailscale git ref (default: v1.101.0)
+#   --ref REF        tailscale git ref (default: v1.102.0)
 #   --keep           reuse an existing checkout instead of re-cloning
 set -eu
 
-BASE_REF=v1.101.0
+BASE_REF=v1.102.0
 TAILSCALE_REPO=${TAILSCALE_REPO:-https://github.com/tailscale/tailscale.git}
 
 workdir=$HOME/Workspace/haiku-tailscale

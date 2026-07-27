@@ -85,7 +85,7 @@ If you would rather drive the build yourself:
 
 ```sh
 git clone https://github.com/tailscale/tailscale
-cd tailscale && git checkout v1.101.0
+cd tailscale && git checkout v1.102.0
 /path/to/haiku386-port/apply.sh .
 ./haiku32/build.sh
 ```

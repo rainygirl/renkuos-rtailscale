@@ -14,7 +14,9 @@
 #   arm64    github.com/rainygirl/renkuos-golang. On RenkuOS itself that is
 #            "pkgman install golang_bin", and this script then builds
 #            natively; elsewhere use the cross toolchain that repository
-#            builds.
+#            builds. Apply patches/go/go-haiku-arm64-startup.patch of
+#            github.com/rainygirl/renkuos-gotools to it first, or every
+#            binary prints "234567" when it starts.
 #   x86_64   github.com/korli/go, branch golang-1.27-haiku (what HaikuPorts'
 #            golang package is built from), or that package on RenkuOS.
 #

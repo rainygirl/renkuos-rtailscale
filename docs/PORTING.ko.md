@@ -71,7 +71,7 @@ Haiku 자체가 요구하는 것만 합니다.
 또는 `tools/make-hpkg.sh`로 만든 패키지로 설치합니다.
 
 ```sh
-pkgman install ./renkuos_rtailscale-1.102.0-2-arm64.hpkg
+pkgman install ./renkuos_rtailscale-1.102.0-3-arm64.hpkg
 ```
 
 패키지는 `tailscale`, `tailscaled`, `tailscaled-service`, R Tailscale(응용
@@ -247,6 +247,12 @@ TUN 모드는 `1.102.0-2` 패키지로, 로그인한 상태에서 확인했습�
   다시 씀. 쓸 수 없는 tun 이름을 주면 userspace networking으로 전환됐고
   SOCKS5 프록시가 동작함. R Tailscale에 TUN 안내 줄이 표시됨
 - x86_64: 데몬이 SIGTERM으로 멈추고 인터페이스를 내림
+
+revision 3은 arm64 전용입니다. 같은 소스를, 시작할 때 `234567`을 더 이상
+출력하지 않는 Go 툴체인으로 빌드했습니다. RenkuOS arm64에서 revision 2 위에
+파일로 설치한 뒤 다시 pkgman.rainygirl.com에서 설치했고, `tailscale
+version`이 버전만 출력하고, 서비스가 `tun/0`을 열고, MagicDNS 이름으로 피어에
+`ping`과 sshd 배너 읽기가 되고, Mac mini에서 ping이 돌아옴을 확인했습니다.
 
 확인하지 않은 내용입니다.
 

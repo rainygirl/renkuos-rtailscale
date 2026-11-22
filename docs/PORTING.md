@@ -72,7 +72,7 @@ Without a package, from a checkout that has `dist/<arch>/` built:
 Or with a package built by `tools/make-hpkg.sh`:
 
 ```sh
-pkgman install ./renkuos_rtailscale-1.102.0-2-arm64.hpkg
+pkgman install ./renkuos_rtailscale-1.102.0-3-arm64.hpkg
 ```
 
 The package installs `tailscale`, `tailscaled`, `tailscaled-service`,
@@ -260,6 +260,12 @@ first, then again with `pkgman install` from pkgman.rainygirl.com):
   daemon fell back to userspace networking and the SOCKS5 proxy worked.
   R Tailscale shows the TUN line.
 - x86_64: the daemon stops on SIGTERM and takes the interface down
+
+Revision 3 is arm64 only: the same source built with a Go toolchain that no
+longer prints `234567` at startup. On RenkuOS arm64 it was installed from the
+file over revision 2 and then from pkgman.rainygirl.com; `tailscale version`
+prints only the version, the service opens `tun/0`, a peer answers `ping` and
+its sshd banner by MagicDNS name, and the Mac mini pings back.
 
 Not verified:
 

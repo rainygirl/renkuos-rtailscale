@@ -31,6 +31,12 @@ namespace {
 const char* const kSignature = "application/x-vnd.rainygirl-RTailscale";
 const char* const kTerminalSignature = "application/x-vnd.Haiku-Terminal";
 
+// Which of the two is shown depends on how the daemon reaches the system.
+const char* const kProxyNote
+	= "Apps reach the tailnet through SOCKS5 127.0.0.1:1055 or HTTP proxy 127.0.0.1:1056.";
+const char* const kTunNote
+	= "Every app reaches the tailnet directly, by address or by MagicDNS name.";
+
 const bigtime_t kPollInterval = 2000000;
 
 enum {
@@ -223,6 +229,7 @@ private:
 	BButton* fSsh;
 	BButton* fCopyIp;
 	BButton* fSignOut;
+	BStringView* fProxy;
 	BStringView* fVersion;
 
 	Status fStatus;
@@ -303,12 +310,11 @@ MainWindow::MainWindow()
 	fCopyIp->SetEnabled(false);
 	fSignOut->SetEnabled(false);
 
-	BStringView* proxy = new BStringView("proxy",
-		T("Apps reach the tailnet through SOCKS5 127.0.0.1:1055 or HTTP proxy 127.0.0.1:1056."));
+	fProxy = new BStringView("proxy", T(kProxyNote));
 	BFont small(be_plain_font);
 	small.SetSize(em * 0.9f);
-	proxy->SetFont(&small);
-	proxy->SetHighUIColor(B_PANEL_TEXT_COLOR, B_DARKEN_1_TINT);
+	fProxy->SetFont(&small);
+	fProxy->SetHighUIColor(B_PANEL_TEXT_COLOR, B_DARKEN_1_TINT);
 	fVersion = new BStringView("version", "");
 	fVersion->SetFont(&small);
 	fVersion->SetHighUIColor(B_PANEL_TEXT_COLOR, B_DARKEN_1_TINT);
@@ -334,7 +340,7 @@ MainWindow::MainWindow()
 			.Add(fSignOut)
 		.End()
 		.AddGroup(B_VERTICAL, 0)
-			.Add(proxy)
+			.Add(fProxy)
 			.Add(fVersion)
 		.End();
 
@@ -588,6 +594,7 @@ MainWindow::_Apply(const Status& status)
 	}
 
 	fVersion->SetText(status.version.c_str());
+	fProxy->SetText(T(status.tun ? kTunNote : kProxyNote));
 	_RebuildPeers(status);
 }
 
@@ -667,8 +674,9 @@ MainWindow::_OpenSsh()
 		return;
 	}
 
-	// tailscaled runs in userspace-networking mode: the system has no route
-	// to tailnet addresses, so ssh has to be carried by "tailscale nc".
+	// Carried by "tailscale nc": in userspace-networking mode the system has
+	// no route to tailnet addresses, and with a TUN interface this works just
+	// the same.
 	std::string target = user.empty() ? peer->ip : user + "@" + peer->ip;
 	std::string command = "ssh -o ProxyCommand='" + localapi::CliPath()
 		+ " nc %h %p' " + target

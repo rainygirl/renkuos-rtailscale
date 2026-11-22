@@ -56,16 +56,17 @@ index 1cc3ccb..8b07593 100644
  			return ""
  		}
 diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
-index d7c19f5..db64e88 100644
+index d7c19f5..10b8a8b 100644
 --- a/cmd/tailscaled/tailscaled.go
 +++ b/cmd/tailscaled/tailscaled.go
-@@ -80,7 +80,8 @@ func defaultTunName() string {
+@@ -80,7 +80,9 @@ func defaultTunName() string {
  		return "utun"
  	case "plan9":
  		return "auto"
 -	case "aix", "solaris", "illumos":
 +	case "aix", "solaris", "illumos", "haiku":
-+		// Haiku: net/tstun has no TUN device to open here.
++		// Haiku: a TUN device exists (--tun=tun) but not on every image,
++		// and it is IPv4 only, so it is opt-in.
  		return "userspace-networking"
  	case "linux":
  		if buildfeatures.HasSynology && buildfeatures.HasNetstack && distro.Get() == distro.Synology {
@@ -86,6 +87,80 @@ index 19efaf9..662c98c 100644
  	case "js", "plan9":
  		return true, true
  	}
+diff --git a/net/dns/manager_default.go b/net/dns/manager_default.go
+index b514a74..4fb973f 100644
+--- a/net/dns/manager_default.go
++++ b/net/dns/manager_default.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (!linux || android) && !freebsd && !openbsd && !windows && !darwin && !illumos && !solaris && !plan9
++//go:build (!linux || android) && !freebsd && !openbsd && !windows && !darwin && !illumos && !solaris && !plan9 && !haiku
+ 
+ package dns
+ 
+diff --git a/net/dns/manager_haiku.go b/net/dns/manager_haiku.go
+new file mode 100644
+index 0000000..58e8270
+--- /dev/null
++++ b/net/dns/manager_haiku.go
+@@ -0,0 +1,25 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package dns
++
++import (
++	"tailscale.com/control/controlknobs"
++	"tailscale.com/health"
++	"tailscale.com/types/logger"
++	"tailscale.com/util/eventbus"
++	"tailscale.com/util/syspolicy/policyclient"
++)
++
++// NewOSConfigurator creates a new OS configurator.
++//
++// Haiku's resolver reads the resolv.conf that net_server keeps in the
++// network settings directory (see resolvconfpath_haiku.go), so the file is
++// replaced directly, with a backup beside it. net_server rewrites the file
++// when an interface is reconfigured, which undoes the change until the next
++// time tailscaled applies its DNS configuration.
++func NewOSConfigurator(logf logger.Logf, health *health.Tracker, bus *eventbus.Bus, _ policyclient.Client, _ *controlknobs.Knobs, _ string) (OSConfigurator, error) {
++	return newDirectManager(logf, health, bus), nil
++}
+diff --git a/net/dns/resolvconfpath_default.go b/net/dns/resolvconfpath_default.go
+index 00caf30..fa7ca1d 100644
+--- a/net/dns/resolvconfpath_default.go
++++ b/net/dns/resolvconfpath_default.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !gokrazy
++//go:build !gokrazy && !haiku
+ 
+ package dns
+ 
+diff --git a/net/dns/resolvconfpath_haiku.go b/net/dns/resolvconfpath_haiku.go
+new file mode 100644
+index 0000000..585596f
+--- /dev/null
++++ b/net/dns/resolvconfpath_haiku.go
+@@ -0,0 +1,11 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package dns
++
++const (
++	resolvConf = "/boot/system/settings/network/resolv.conf"
++	backupConf = "/boot/system/settings/network/resolv.pre-tailscale-backup.conf"
++)
 diff --git a/net/netmon/interfaces_haiku.go b/net/netmon/interfaces_haiku.go
 new file mode 100644
 index 0000000..bbbd3c8
@@ -156,32 +231,6 @@ index 0000000..bbbd3c8
 +	}
 +	return ret, nil
 +}
-diff --git a/net/tstun/tstun_stub.go b/net/tstun/tstun_stub.go
-index 27d530b..07eb4fd 100644
---- a/net/tstun/tstun_stub.go
-+++ b/net/tstun/tstun_stub.go
-@@ -1,7 +1,7 @@
- // Copyright (c) Tailscale Inc & contributors
- // SPDX-License-Identifier: BSD-3-Clause
- 
--//go:build aix || solaris || illumos
-+//go:build aix || solaris || illumos || haiku
- 
- package tstun
- 
-diff --git a/net/tstun/tun.go b/net/tstun/tun.go
-index 42b0d23..d718c2c 100644
---- a/net/tstun/tun.go
-+++ b/net/tstun/tun.go
-@@ -1,7 +1,7 @@
- // Copyright (c) Tailscale Inc & contributors
- // SPDX-License-Identifier: BSD-3-Clause
- 
--//go:build !wasm && !tamago && !aix && !solaris && !illumos
-+//go:build !wasm && !tamago && !aix && !solaris && !illumos && !haiku
- 
- // Package tun creates a tuntap device, working around OS-specific
- // quirks if necessary.
 diff --git a/paths/access_haiku.go b/paths/access_haiku.go
 new file mode 100644
 index 0000000..99a91ed
@@ -267,3 +316,194 @@ index b1556b2..cce7038 100644
  		if err == nil {
  			return path
  		}
+diff --git a/wgengine/router/osrouter/router_haiku.go b/wgengine/router/osrouter/router_haiku.go
+new file mode 100644
+index 0000000..af7bef6
+--- /dev/null
++++ b/wgengine/router/osrouter/router_haiku.go
+@@ -0,0 +1,185 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package osrouter
++
++import (
++	"fmt"
++	"net"
++	"net/netip"
++	"os"
++	"os/exec"
++	"strings"
++
++	"github.com/tailscale/wireguard-go/tun"
++	"tailscale.com/net/netmon"
++	"tailscale.com/net/tsaddr"
++	"tailscale.com/types/logger"
++	"tailscale.com/wgengine/router"
++)
++
++func init() {
++	router.HookNewUserspaceRouter.Set(func(opts router.NewOpts) (router.Router, error) {
++		return newHaikuRouter(opts.Logf, opts.Tun)
++	})
++	router.HookCleanUp.Set(func(logf logger.Logf, _ *netmon.Monitor, ifName string) {
++		for _, name := range strings.Split(ifName, ",") {
++			switch {
++			case strings.HasPrefix(name, "tun/"):
++				haikuDown(logf, name)
++			case name == "tun":
++				// The daemon took the first free interface and nothing
++				// recorded which: take down the ones that carry a
++				// Tailscale address.
++				for i := 0; i < 10; i++ {
++					n := fmt.Sprintf("tun/%d", i)
++					if haikuHasTailscaleAddr(n) {
++						haikuDown(logf, n)
++					}
++				}
++			}
++		}
++	})
++}
++
++// haikuRouter configures a tun interface with Haiku's ifconfig and route.
++//
++// Only IPv4 is set up. Haiku's tunnel device refuses an IPv6 address
++// ("Invalid Argument"), so the tailnet's IPv6 addresses and routes are left
++// out; peers are reached by their IPv4 addresses.
++type haikuRouter struct {
++	logf    logger.Logf
++	tunname string
++	local   netip.Prefix
++	routes  map[netip.Prefix]bool
++}
++
++func newHaikuRouter(logf logger.Logf, tundev tun.Device) (router.Router, error) {
++	tunname, err := tundev.Name()
++	if err != nil {
++		return nil, err
++	}
++	return &haikuRouter{logf: logf, tunname: tunname}, nil
++}
++
++func haikuRun(logf logger.Logf, args ...string) error {
++	out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
++	if err != nil {
++		err = fmt.Errorf("%s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
++		logf("%v", err)
++	}
++	return err
++}
++
++// haikuDown takes a tun interface down, which also removes its routes. It
++// is deliberately not removed: see NativeTun.Close in wireguard-go.
++func haikuDown(logf logger.Logf, name string) {
++	if _, err := os.Stat("/dev/" + name); err != nil {
++		return // no such interface
++	}
++	haikuRun(logf, "ifconfig", name, "down")
++}
++
++// haikuHasTailscaleAddr reports whether ifconfig shows the interface with an
++// address in the range Tailscale assigns from.
++func haikuHasTailscaleAddr(name string) bool {
++	out, err := exec.Command("ifconfig", name).Output()
++	if err != nil {
++		return false
++	}
++	for _, f := range strings.FieldsFunc(string(out), func(r rune) bool {
++		return r == ' ' || r == ',' || r == '\n' || r == '\t'
++	}) {
++		if a, err := netip.ParseAddr(f); err == nil && tsaddr.CGNATRange().Contains(a) {
++			return true
++		}
++	}
++	return false
++}
++
++func haikuMask(p netip.Prefix) string {
++	return net.IP(net.CIDRMask(p.Bits(), 32)).String()
++}
++
++func (r *haikuRouter) Up() error {
++	return haikuRun(r.logf, "ifconfig", r.tunname, "up")
++}
++
++func (r *haikuRouter) route(verb string, p netip.Prefix) error {
++	return haikuRun(r.logf, "route", verb, r.tunname, "inet",
++		p.Masked().Addr().String(), "netmask", haikuMask(p))
++}
++
++func (r *haikuRouter) Set(cfg *router.Config) (reterr error) {
++	if cfg == nil {
++		cfg = &shutdownConfig
++	}
++	setErr := func(err error) {
++		if err != nil && reterr == nil {
++			reterr = err
++		}
++	}
++
++	// An interface has one IPv4 address here; setting it replaces the old one.
++	var local netip.Prefix
++	for _, a := range cfg.LocalAddrs {
++		if a.Addr().Is4() {
++			local = a
++			break
++		}
++	}
++	addrChanged := local != r.local
++	if addrChanged {
++		if r.local.IsValid() && local.IsValid() {
++			// A different address: start from an interface without routes.
++			haikuRun(r.logf, "ifconfig", r.tunname, "down")
++			r.routes = nil
++		}
++		if local.IsValid() {
++			// The interface's own route covers only this address; every
++			// other destination is added below.
++			err := haikuRun(r.logf, "ifconfig", r.tunname, "inet",
++				local.Addr().String(), "netmask", "255.255.255.255", "up")
++			setErr(err)
++			if err == nil {
++				r.local = local
++			}
++		} else {
++			// Nothing left to be. Down takes the routes along; the
++			// address stays on the interface but means nothing there.
++			setErr(haikuRun(r.logf, "ifconfig", r.tunname, "down"))
++			r.local = netip.Prefix{}
++			r.routes = nil
++		}
++	}
++
++	want := make(map[netip.Prefix]bool)
++	if local.IsValid() {
++		for _, p := range cfg.Routes {
++			if p.Addr().Is4() && p.Masked() != local.Masked() {
++				want[p.Masked()] = true
++			}
++		}
++	}
++	for p := range r.routes {
++		if !want[p] {
++			setErr(r.route("delete", p))
++		}
++	}
++	for p := range want {
++		if !r.routes[p] {
++			if err := r.route("add", p); err != nil {
++				setErr(err)
++				delete(want, p)
++			}
++		}
++	}
++	r.routes = want
++	return reterr
++}
++
++func (r *haikuRouter) Close() error {
++	return r.Set(nil)
++}

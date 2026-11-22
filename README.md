@@ -26,6 +26,11 @@ Applications), and a launch job that starts the service at login. Right
 after installing, before the next login, R Tailscale starts the service
 itself.
 
+On arm64 and x86_64 the service uses a TUN interface: every program reaches
+the tailnet directly (IPv4), and MagicDNS names resolve system-wide, for which
+the system's `resolv.conf` is replaced while the service runs. Details and
+the fallback are in [docs/PORTING.md](docs/PORTING.md#using-it).
+
 ## Sign in
 
 Open **R Tailscale** from Deskbar -> Applications and press **Sign in**. It

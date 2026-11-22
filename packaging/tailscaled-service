@@ -1,18 +1,26 @@
 #!/bin/sh
-# Runs tailscaled the way this port expects: userspace networking (there is no
-# TUN device to hand it), state under ~/config/settings/tailscale, and the two
-# local proxies applications use to reach the tailnet.
+# Runs tailscaled the way this port expects: state under
+# ~/config/settings/tailscale, and the two local proxies.
+#
+# The daemon is asked for a TUN interface first ("tun": the first free
+# tun/<n>), so every program reaches the tailnet through the system's own
+# network stack and MagicDNS names resolve everywhere. Where the image has no
+# tunnel driver it falls back to userspace networking, and then only the
+# proxies lead to the tailnet.
 #
 # Started at login by the launch job in this package, and by R Tailscale's
 # "Start service" button. A second copy exits at once: tailscaled refuses to
 # start while another one owns the socket.
 #
+#   TS_TUN           default tun,userspace-networking
+#                    ("userspace-networking" alone never touches the system)
 #   TS_SOCKS5_ADDR   default 127.0.0.1:1055
 #   TS_HTTP_ADDR     default 127.0.0.1:1056
-set -eu
+set -u
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 state_dir=${TS_STATE_DIR:-/boot/home/config/settings/tailscale}
+tun=${TS_TUN:-tun,userspace-networking}
 mkdir -p "$state_dir"
 
 daemon=$here/tailscaled
@@ -22,11 +30,32 @@ daemon=$here/tailscaled
 log=$state_dir/tailscaled.log
 [ -f "$log" ] && mv -f "$log" "$log.1"
 
-exec "$daemon" \
-	--tun=userspace-networking \
+# In TUN mode the daemon puts its own resolver into the system's resolv.conf.
+# It cannot be stopped politely (it does not react to SIGTERM, see
+# docs/PORTING.md), so whoever stops it kills it, and a killed daemon restores
+# nothing. --cleanup does: it puts resolv.conf back and removes the interface.
+# Run it after the daemon is gone - and before starting, for the case where
+# this script was killed as well. It must not run while another daemon is
+# alive, hence the socket check.
+cleanup() {
+	"$daemon" --cleanup --tun="$tun" --socket="$state_dir/tailscaled.sock" \
+		--statedir="$state_dir" >>"$log" 2>&1
+}
+
+if "$here/tailscale" --socket="$state_dir/tailscaled.sock" version --daemon >/dev/null 2>&1; then
+	echo "tailscaled is already running" >"$log"
+	exit 0
+fi
+
+cleanup
+"$daemon" \
+	--tun="$tun" \
 	--socket="$state_dir/tailscaled.sock" \
 	--state="$state_dir/tailscaled.state" \
 	--statedir="$state_dir" \
 	--socks5-server="${TS_SOCKS5_ADDR:-127.0.0.1:1055}" \
 	--outbound-http-proxy-listen="${TS_HTTP_ADDR:-127.0.0.1:1056}" \
-	>"$log" 2>&1
+	>>"$log" 2>&1
+status=$?
+cleanup
+exit $status

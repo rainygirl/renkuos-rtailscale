@@ -160,6 +160,7 @@ FetchStatus()
 
 	status.reachable = true;
 	status.backend = root["BackendState"].Str();
+	status.tun = root["TUN"].IsTrue();
 	status.authUrl = root["AuthURL"].Str();
 	status.version = root["Version"].Str();
 	status.tailnet = root["CurrentTailnet"]["Name"].Str();

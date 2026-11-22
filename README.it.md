@@ -26,6 +26,12 @@ Applications) e un job di launch che avvia il servizio all'accesso. Subito
 dopo l'installazione, prima dell'accesso successivo, è R Tailscale ad avviare
 il servizio.
 
+Su arm64 e x86_64 il servizio usa un'interfaccia TUN: ogni programma raggiunge
+la tailnet direttamente (IPv4) e i nomi MagicDNS vengono risolti in tutto il
+sistema; per questo il `resolv.conf` di sistema viene sostituito mentre il
+servizio è in esecuzione. I dettagli e il comportamento alternativo sono in
+[docs/PORTING.md](docs/PORTING.md#using-it).
+
 ## Accesso
 
 Apri **R Tailscale** da Deskbar -> Applications e premi **Sign in**. Mostra il

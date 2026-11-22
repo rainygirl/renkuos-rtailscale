@@ -44,6 +44,8 @@ static const Translation kTranslations[] = {
 	{ "The Tailscale service did not answer.", "Tailscale 서비스가 응답하지 않습니다." },
 	{ "Apps reach the tailnet through SOCKS5 127.0.0.1:1055 or HTTP proxy 127.0.0.1:1056.",
 		"앱은 SOCKS5 127.0.0.1:1055 또는 HTTP 프록시 127.0.0.1:1056으로 tailnet에 접속합니다." },
+	{ "Every app reaches the tailnet directly, by address or by MagicDNS name.",
+		"모든 앱이 주소나 MagicDNS 이름으로 tailnet에 바로 접속합니다." },
 };
 
 

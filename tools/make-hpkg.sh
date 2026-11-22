@@ -90,12 +90,18 @@ ln -s ../../../../apps/RTailscale "$stage/data/deskbar/menu/Applications/R Tails
 cp "$here/packaging/tailscale.launch" "$stage/data/launch/tailscale"
 cp "$here"/README*.md "$here/LICENSE" "$stage/documentation/packages/$name/"
 
+if [ "$arch" = x86_gcc2 ]; then
+	netdesc="tailscaled runs in userspace-networking mode and offers the tailnet to applications through a SOCKS5 proxy (127.0.0.1:1055) and an HTTP proxy (127.0.0.1:1056)"
+else
+	netdesc="tailscaled uses a TUN interface, so every application reaches the tailnet directly (IPv4) and MagicDNS names resolve system-wide; without the tunnel driver it falls back to userspace networking. A SOCKS5 proxy (127.0.0.1:1055) and an HTTP proxy (127.0.0.1:1056) are offered either way"
+fi
+
 cat > "$stage/.PackageInfo" <<INFO
 name		$name
 version		$VERSION-$REVISION
 architecture	$arch
 summary		"Tailscale for RenkuOS: the daemon, the CLI and the R Tailscale window"
-description	"An unofficial port of Tailscale $VERSION to RenkuOS/Haiku. tailscaled runs in userspace-networking mode and offers the tailnet to applications through a SOCKS5 proxy (127.0.0.1:1055) and an HTTP proxy (127.0.0.1:1056); the tailscale command is the usual CLI; R Tailscale is a native window that shows the connection state and the devices in the tailnet, signs in and out, and opens ssh to a device. Not affiliated with Tailscale Inc."
+description	"An unofficial port of Tailscale $VERSION to RenkuOS/Haiku. $netdesc; the tailscale command is the usual CLI; R Tailscale is a native window that shows the connection state and the devices in the tailnet, signs in and out, and opens ssh to a device. Not affiliated with Tailscale Inc."
 packager	"${PACKAGER:-rainygirl}"
 vendor		"$vendor"
 copyrights {

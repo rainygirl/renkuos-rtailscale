@@ -31,3 +31,185 @@ diff --git a/rwcancel/rwcancel_stub.go b/rwcancel/rwcancel_stub.go
 @@ -1 +1 @@
 -//go:build windows || wasm || plan9 || tamago
 +//go:build windows || wasm || plan9 || tamago || haiku
+diff --git a/tun/tun_haiku.go b/tun/tun_haiku.go
+new file mode 100644
+--- /dev/null
++++ b/tun/tun_haiku.go
+@@ -0,0 +1,177 @@
++//go:build haiku
++
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
++ */
++
++package tun
++
++import (
++	"fmt"
++	"os"
++	"os/exec"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"syscall"
++)
++
++// Haiku's tunnel driver (src/add-ons/kernel/network/devices/tunnel) has no
++// clone device. A tun interface named "tun/<n>" comes into being when the
++// network stack is asked to configure it, and only then is /dev/tun/<n>
++// published. The device carries bare IP packets, one per read or write, and
++// can be opened by one process at a time.
++
++// haikuMaxTunnels is the size of the driver's device table.
++const haikuMaxTunnels = 10
++
++type NativeTun struct {
++	name      string
++	fd        int
++	mtu       int
++	events    chan Event
++	closed    atomic.Bool
++	closeOnce sync.Once
++	closeErr  error
++}
++
++func haikuIfconfig(args ...string) error {
++	out, err := exec.Command("ifconfig", args...).CombinedOutput()
++	if err != nil {
++		return fmt.Errorf("ifconfig %s: %v: %s", strings.Join(args, " "), err,
++			strings.TrimSpace(string(out)))
++	}
++	return nil
++}
++
++// CreateTUN opens the tun interface called name, creating it if needed.
++// name is "tun/<n>", or "tun" for the first interface that is free.
++func CreateTUN(name string, mtu int) (Device, error) {
++	var names []string
++	switch {
++	case name == "tun":
++		for i := 0; i < haikuMaxTunnels; i++ {
++			names = append(names, "tun/"+strconv.Itoa(i))
++		}
++	case strings.HasPrefix(name, "tun/"):
++		names = []string{name}
++	default:
++		return nil, fmt.Errorf("tun name %q: must be \"tun\" or \"tun/<n>\"", name)
++	}
++
++	var lastErr error
++	for _, n := range names {
++		dev, err := openHaikuTun(n, mtu)
++		if err == nil {
++			return dev, nil
++		}
++		// Busy, or unusable for another reason: with "tun" any other
++		// interface will do.
++		lastErr = err
++	}
++	return nil, lastErr
++}
++
++func openHaikuTun(name string, mtu int) (Device, error) {
++	// Naming the interface is what creates it. One that already exists, left
++	// down by an earlier daemon, is brought up again and reused.
++	if _, err := os.Stat("/dev/" + name); err == nil {
++		// Routes of a daemon that was killed would collide with the ones
++		// about to be added; taking the interface down drops them.
++		haikuIfconfig(name, "down")
++	}
++	args := []string{name}
++	if mtu > 0 {
++		args = append(args, "mtu", strconv.Itoa(mtu))
++	}
++	args = append(args, "up")
++	if err := haikuIfconfig(args...); err != nil {
++		return nil, err
++	}
++	fd, err := syscall.Open("/dev/"+name, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
++	if err != nil {
++		return nil, fmt.Errorf("open /dev/%s: %w", name, err)
++	}
++	t := &NativeTun{
++		name:   name,
++		fd:     fd,
++		mtu:    mtu,
++		events: make(chan Event, 10),
++	}
++	t.events <- EventUp
++	return t, nil
++}
++
++func (t *NativeTun) Name() (string, error) { return t.name, nil }
++
++// File returns nil: the descriptor is used with plain blocking system calls,
++// see Close.
++func (t *NativeTun) File() *os.File { return nil }
++
++func (t *NativeTun) Events() <-chan Event { return t.events }
++
++func (t *NativeTun) MTU() (int, error) { return t.mtu, nil }
++
++func (t *NativeTun) BatchSize() int { return 1 }
++
++func (t *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
++	for {
++		n, err := syscall.Read(t.fd, bufs[0][offset:])
++		if t.closed.Load() {
++			return 0, os.ErrClosed
++		}
++		if err == syscall.EINTR {
++			continue
++		}
++		if err != nil {
++			return 0, err
++		}
++		if n == 0 {
++			continue
++		}
++		sizes[0] = n
++		return 1, nil
++	}
++}
++
++func (t *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
++	for i, buf := range bufs {
++		for {
++			_, err := syscall.Write(t.fd, buf[offset:])
++			if t.closed.Load() {
++				return i, os.ErrClosed
++			}
++			if err == syscall.EINTR {
++				continue
++			}
++			if err != nil {
++				return i, err
++			}
++			break
++		}
++	}
++	return len(bufs), nil
++}
++
++// Close closes the descriptor directly rather than through an os.File. A
++// blocked read holds a reference on an os.File, so its Close would wait for
++// the read to return; the driver, on the other hand, wakes its readers when
++// the descriptor itself is closed.
++//
++// The interface is taken down, which removes its routes, but not removed.
++// Removing an interface whose device is not fully closed yet - and it stays
++// open for a moment after close, until the last reader has left the driver -
++// takes the interface away while the device stays registered, and the name
++// can then be neither opened nor created again for a while. An interface
++// that is down costs nothing and is reused by the next CreateTUN.
++func (t *NativeTun) Close() error {
++	t.closeOnce.Do(func() {
++		t.closed.Store(true)
++		t.closeErr = syscall.Close(t.fd)
++		close(t.events)
++		haikuIfconfig(t.name, "down")
++	})
++	return t.closeErr
++}

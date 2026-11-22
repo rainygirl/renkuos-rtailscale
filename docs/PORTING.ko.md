@@ -36,12 +36,14 @@ i386/                    32비트 x86 포트 (자체 README와 스크립트 포�
 런처는 시작이 성공할 때까지 데몬을 다시 띄웁니다.
 
 64비트 Go 포트에는 이런 결함이 없으므로 그 코드를 가져오지 않았습니다.
-64비트 패치는 12개 파일 125줄이고, Haiku 자체가 요구하는 것만 합니다.
+64비트 패치는 15개 파일 약 350줄이고(절반은 TUN 인터페이스용 라우터),
+Haiku 자체가 요구하는 것만 합니다.
 
 | 변경 | 이유 |
 | --- | --- |
-| `net/tstun`: 스텁 장치 사용 | 열 수 있는 TUN 장치가 없음 |
-| `cmd/tailscaled`: 기본값을 `userspace-networking`으로 | 위 항목의 결과 |
+| `wgengine/router/osrouter`: Haiku용 라우터 | `ifconfig`와 `route`로 tun 인터페이스의 주소와 tailnet 경로를 설정 |
+| `net/dns`: 시스템의 `resolv.conf` 기록 | Haiku의 리졸버는 `/etc/resolv.conf`가 아니라 `/boot/system/settings/network/resolv.conf`를 읽음 |
+| `cmd/tailscaled`: 기본값을 `userspace-networking`으로 | 터널 드라이버가 모든 이미지에 있지는 않음. 서비스가 `tun`을 먼저 요청하고 안 되면 전환 |
 | `paths`: 소켓과 상태를 `~/config/settings/tailscale`에 | Haiku에는 `/var/run`, `/var/lib` 관례가 없음 |
 | `paths`, `cmd/tailscale/cli`: `golang.org/x/sys/unix` 호출 제거 | 이 모듈은 Haiku를 지원하지 않음 |
 | `ipn/ipnserver`: 피어 자격 증명 없이 LocalAPI 클라이언트 허용 | Haiku가 이를 제공하지 않음. 소켓은 소유자 설정 디렉터리의 0600 모드 |
@@ -49,7 +51,10 @@ i386/                    32비트 x86 포트 (자체 README와 스크립트 포�
 
 `deps/`에는 두 가지가 더 있습니다.
 
-- **wireguard-go**: 빌드 태그 네 개를 고쳐 스텁 구현이 쓰이게 합니다.
+- **wireguard-go**: 빌드 태그 네 개를 고쳐 스텁 구현이 쓰이게 하고, TUN 장치인
+  `tun/tun_haiku.go`를 더합니다. Haiku의 터널 드라이버에는 클론 장치가 없습니다.
+  `tun/<n>`이라는 인터페이스를 설정하면 그때 만들어지고 `/dev/tun/<n>`이
+  생기며, 읽기와 쓰기 한 번에 IP 패킷 하나가 오갑니다.
 - **gvisor**: IP 식별자 버킷을 2048개에서 64개로 줄입니다. 버킷마다
   `crypto/rand`로 초기화하는데 Haiku의 `getentropy`가 8KiB를 만들어내는 데
   매우 오래 걸릴 수 있어, RenkuOS/arm64에서 이 초기화 하나가 시작을 36~45초
@@ -66,7 +71,7 @@ i386/                    32비트 x86 포트 (자체 README와 스크립트 포�
 또는 `tools/make-hpkg.sh`로 만든 패키지로 설치합니다.
 
 ```sh
-pkgman install ./renkuos_rtailscale-1.102.0-1-arm64.hpkg
+pkgman install ./renkuos_rtailscale-1.102.0-2-arm64.hpkg
 ```
 
 패키지는 `tailscale`, `tailscaled`, `tailscaled-service`, R Tailscale(응용
@@ -78,16 +83,46 @@ pkgman install ./renkuos_rtailscale-1.102.0-1-arm64.hpkg
 
 ## 사용
 
-`tailscaled`는 userspace-networking 모드로 동작합니다. 운영체제의 트래픽을
-라우팅하지 **않습니다**. `100.x.y.z` 경로가 없고 MagicDNS로 이름이 풀리지도
-않습니다. 응용 프로그램은 서비스가 여는 두 프록시로 tailnet에 접속합니다.
+arm64와 x86_64에서 `tailscaled`는 TUN 인터페이스(`tun/0`, 또는 비어 있는 첫
+번째)를 엽니다. 그러면 시스템에 tailnet의 모든 기기로 가는 경로가 생기고
+MagicDNS 이름이 풀리므로, 어떤 프로그램이든 tailnet에 바로 접속합니다. 다른
+기기도 이 기기의 서비스(sshd 포함)에 바로 접속합니다.
+
+```sh
+ping mac-mini
+ssh user@mac-mini
+```
+
+이 모드에서 알아 둘 세 가지입니다.
+
+- **IPv4만 됩니다.** 터널 드라이버가 IPv6 주소를 거부하므로 tailnet의
+  `fd7a:...` 주소는 설정되지 않습니다.
+- **서비스가 도는 동안 `resolv.conf`가 바뀝니다.** 원본은 옆에
+  `resolv.pre-tailscale-backup.conf`로 보관됩니다. `tailscale set
+  --accept-dns=false`를 쓰면 건드리지 않습니다. `tailscaled-service`는 데몬이
+  어떻게 끝나든 끝난 뒤에, 그리고 다음 시작 전에 파일을 되돌립니다.
+  net_server가 인터페이스를 다시 설정할 때(예: DHCP 갱신) 이 파일을 새로
+  쓰는데, 그러면 tailscaled가 설정을 다시 적용할 때까지 tailnet 리졸버가
+  빠집니다.
+- **서비스가 멈출 때 인터페이스는 지우지 않고 내립니다.** 다음 시작에서 다시
+  씁니다. 장치를 닫은 직후에 인터페이스를 지우면 그 이름을 한동안 쓸 수 없게
+  될 수 있습니다.
+
+터널 드라이버가 없는 이미지와 32비트 x86에서는 userspace-networking 모드로
+동작합니다. 이때는 운영체제의 트래픽을 라우팅하지 **않고** MagicDNS로 이름이
+풀리지도 않습니다. `tailscaled-service`의 환경에 `TS_TUN=userspace-networking`을
+주면 이 모드를 강제합니다. 어느 모드인지는 R Tailscale의 맨 아래 줄에
+표시됩니다.
+
+두 모드 모두 서비스가 프록시 두 개를 엽니다. userspace 모드에서는 응용
+프로그램이 이 프록시로 tailnet에 접속합니다.
 
 | | 주소 |
 | --- | --- |
 | SOCKS5 | `127.0.0.1:1055` |
 | HTTP 프록시 | `127.0.0.1:1056` |
 
-ssh는 CLI를 거칩니다.
+userspace 모드에서 ssh는 CLI를 거칩니다.
 
 ```sh
 ssh -o ProxyCommand='tailscale nc %h %p' user@100.x.y.z
@@ -200,7 +235,23 @@ pkgman.rainygirl.com에 게시한 패키지로 확인한 내용입니다.
   renkuos_rtailscale_x86` 후 `tailscaled-service`가 i386 실행기를 실행하고,
   데몬이 준비되며, R Tailscale이 로그인 링크를 표시함
 
+TUN 모드는 `1.102.0-2` 패키지로, 로그인한 상태에서 확인했습니다(먼저 파일로
+설치하고, 다시 pkgman.rainygirl.com에서 `pkgman install`로 설치).
+
+- arm64(RenkuOS, hrev60072)와 x86_64(Haiku nightly hrev60450): 서비스가
+  `tun/0`을 엶. 프록시 없이 `ping`과 `curl`이 MagicDNS 이름으로 피어에 닿음.
+  다른 기기에서 이 기기로 ping이 되고 sshd 배너를 읽음. 인터넷 접속은 그대로
+  됨
+- arm64: 서비스를 시작하고 데몬을 `kill -9`로 죽이기를 다섯 번 반복. 매번
+  `resolv.conf`와 라우팅 테이블이 이전 상태로 돌아왔고 다음 시작이 `tun/0`을
+  다시 씀. 쓸 수 없는 tun 이름을 주면 userspace networking으로 전환됐고
+  SOCKS5 프록시가 동작함. R Tailscale에 TUN 안내 줄이 표시됨
+- x86_64: 데몬이 SIGTERM으로 멈추고 인터페이스를 내림
+
 확인하지 않은 내용입니다.
+
+- **TUN 모드에서**: 연결 중의 DHCP 갱신, 잠자기 후 깨어남, 서브넷 라우트
+  수락, IPv6 전반
 
 - **x86_64에서**: R Tailscale의 SSH와 IP 복사 버튼, 들어오는 연결
 - **32비트에서**: 이 패키지로 로그인 링크 이후의 동작(i386 포트 자체는 로그인된
@@ -222,7 +273,7 @@ pkgman.rainygirl.com에 게시한 패키지로 확인한 내용입니다.
   런타임 문제입니다. 같은 haiku/arm64 툴체인으로 빌드한 최소 Go 프로그램도
   `signal.Notify` 사용 여부와 관계없이 두 시그널을 무시합니다. 서비스는
   `kill -9 <team>`으로 멈추세요. 상태 파일은 바뀔 때마다 기록되고, 다음 시작
-  때 남은 소켓을 교체합니다.
+  때 남은 소켓을 교체합니다. x86_64에서는 데몬이 SIGTERM으로 멈춥니다.
 - R Tailscale은 로그인 링크를 기본 브라우저로 엽니다. arm64 시험 이미지에서는
   WebPositive가 시작 중에(WebKit의 시간대 설정 단계에서, 아무것도 불러오기
   전에) 죽었습니다. 링크는 창에 남아 있고 **링크 복사** 버튼이 있으며, 다른

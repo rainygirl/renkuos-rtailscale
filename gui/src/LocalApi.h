@@ -16,6 +16,7 @@ struct Peer {
 struct Status {
 	bool reachable = false; // the daemon answered
 	std::string backend;    // NoState, NeedsLogin, Starting, Running, Stopped...
+	bool tun = false;       // a TUN interface, not userspace networking
 	std::string authUrl;
 	std::string version;
 	std::string selfName;

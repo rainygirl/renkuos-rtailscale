@@ -79,10 +79,10 @@ fi
 
 # --- patched dependencies ----------------------------------------------------
 
-# wireguard-go and gvisor each need a small change. They are copied out of the
-# module cache and pulled in with a replace directive: the cache itself stays
-# pristine, and the go command cannot serve a stale index for a directory it
-# assumes never changes.
+# wireguard-go needs build tags and the Haiku TUN device, gvisor a small
+# change. They are copied out of the module cache and pulled in with a
+# replace directive: the cache itself stays pristine, and the go command
+# cannot serve a stale index for a directory it assumes never changes.
 patched_copy() {
 	module=$1
 	name=$2
@@ -106,9 +106,11 @@ patched_copy gvisor.dev/gvisor gvisor "$here/deps/gvisor-haiku-entropy.patch"
 
 # --- build -------------------------------------------------------------------
 
-# The same minimal feature sets the 32-bit port ships. featuretags is a host
-# program, so it runs for the build machine, not for Haiku.
-daemon_tags=$(cd "$src" && "$go" run ./cmd/featuretags --min --add=netstack,outboundproxy,ipnbus)
+# The minimal feature sets the 32-bit port ships, plus, for the daemon, what
+# a TUN interface needs: osrouter (addresses and routes) and dns (MagicDNS
+# through the system resolver). featuretags is a host program, so it runs for
+# the build machine, not for Haiku.
+daemon_tags=$(cd "$src" && "$go" run ./cmd/featuretags --min --add=netstack,outboundproxy,ipnbus,osrouter,dns)
 cli_tags=$(cd "$src" && "$go" run ./cmd/featuretags --min --add=cli,ipnbus)
 
 # Without these the binaries report "<version>-dev<date>-t<commit>-dirty".

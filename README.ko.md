@@ -25,6 +25,11 @@ Tailscale을 RenkuOS(Haiku)로 옮긴 비공식 포트입니다. `tailscaled` �
 로그인할 때 서비스를 시작하는 launch 작업을 설치합니다. 설치 직후 다음
 로그인 전까지는 R Tailscale이 서비스를 직접 시작합니다.
 
+arm64와 x86_64에서는 서비스가 TUN 인터페이스를 씁니다. 모든 프로그램이
+tailnet에 바로 접속하고(IPv4) MagicDNS 이름이 시스템 전체에서 풀리며, 이를
+위해 서비스가 도는 동안 시스템의 `resolv.conf`가 바뀝니다. 자세한 내용과
+대체 동작은 [docs/PORTING.ko.md](docs/PORTING.ko.md#사용)에 있습니다.
+
 ## 로그인
 
 Deskbar -> 응용 프로그램에서 **R Tailscale**을 열고 **로그인**을 누릅니다.

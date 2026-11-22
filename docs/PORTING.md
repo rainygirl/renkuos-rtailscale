@@ -72,7 +72,7 @@ Without a package, from a checkout that has `dist/<arch>/` built:
 Or with a package built by `tools/make-hpkg.sh`:
 
 ```sh
-pkgman install ./renkuos_rtailscale-1.102.0-3-arm64.hpkg
+pkgman install ./renkuos_rtailscale-1.102.0-4-arm64.hpkg
 ```
 
 The package installs `tailscale`, `tailscaled`, `tailscaled-service`,

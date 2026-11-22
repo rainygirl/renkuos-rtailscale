@@ -71,7 +71,7 @@ Haiku 자체가 요구하는 것만 합니다.
 또는 `tools/make-hpkg.sh`로 만든 패키지로 설치합니다.
 
 ```sh
-pkgman install ./renkuos_rtailscale-1.102.0-3-arm64.hpkg
+pkgman install ./renkuos_rtailscale-1.102.0-4-arm64.hpkg
 ```
 
 패키지는 `tailscale`, `tailscaled`, `tailscaled-service`, R Tailscale(응용

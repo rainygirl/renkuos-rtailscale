@@ -1,0 +1,269 @@
+diff --git a/cmd/tailscale/cli/ssh_getsid_haiku.go b/cmd/tailscale/cli/ssh_getsid_haiku.go
+new file mode 100644
+index 0000000..fd870c3
+--- /dev/null
++++ b/cmd/tailscale/cli/ssh_getsid_haiku.go
+@@ -0,0 +1,13 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package cli
++
++import "errors"
++
++// golang.org/x/sys/unix has no Haiku support, so there is no Getsid to call.
++// The caller only uses the session ID to pick a per-session known_hosts file
++// name and already falls back to the process ID on error.
++func getSessionID(int) (int, error) { return 0, errors.New("session IDs are unsupported on Haiku") }
+diff --git a/cmd/tailscale/cli/ssh_getsid_unix.go b/cmd/tailscale/cli/ssh_getsid_unix.go
+new file mode 100644
+index 0000000..0609c85
+--- /dev/null
++++ b/cmd/tailscale/cli/ssh_getsid_unix.go
+@@ -0,0 +1,10 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !wasm && !windows && !plan9 && !haiku
++
++package cli
++
++import "golang.org/x/sys/unix"
++
++func getSessionID(pid int) (int, error) { return unix.Getsid(pid) }
+diff --git a/cmd/tailscale/cli/ssh_unix.go b/cmd/tailscale/cli/ssh_unix.go
+index 1cc3ccb..8b07593 100644
+--- a/cmd/tailscale/cli/ssh_unix.go
++++ b/cmd/tailscale/cli/ssh_unix.go
+@@ -11,8 +11,6 @@
+ 	"path/filepath"
+ 	"runtime"
+ 	"strconv"
+-
+-	"golang.org/x/sys/unix"
+ )
+ 
+ func init() {
+@@ -30,7 +28,7 @@ func init() {
+ 		// SID is the session ID of the user's login session.
+ 		// It is also the process ID of the original shell that the user logged in with.
+ 		// We only need to check the environment of that process.
+-		sid, err := unix.Getsid(os.Getpid())
++		sid, err := getSessionID(os.Getpid())
+ 		if err != nil {
+ 			return ""
+ 		}
+diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
+index d7c19f5..db64e88 100644
+--- a/cmd/tailscaled/tailscaled.go
++++ b/cmd/tailscaled/tailscaled.go
+@@ -80,7 +80,8 @@ func defaultTunName() string {
+ 		return "utun"
+ 	case "plan9":
+ 		return "auto"
+-	case "aix", "solaris", "illumos":
++	case "aix", "solaris", "illumos", "haiku":
++		// Haiku: net/tstun has no TUN device to open here.
+ 		return "userspace-networking"
+ 	case "linux":
+ 		if buildfeatures.HasSynology && buildfeatures.HasNetstack && distro.Get() == distro.Synology {
+diff --git a/ipn/ipnserver/server.go b/ipn/ipnserver/server.go
+index 19efaf9..662c98c 100644
+--- a/ipn/ipnserver/server.go
++++ b/ipn/ipnserver/server.go
+@@ -345,6 +345,12 @@ func (a *actor) Permissions(operatorUID string) (read, write bool) {
+ 		// checks here. Note that this permission model is being changed in
+ 		// tailscale/corp#18342.
+ 		return true, true
++	case "haiku":
++		// Haiku does not expose peer credentials through the peercred
++		// package. The LocalAPI socket is created with mode 0600 in the
++		// daemon owner's settings directory, so being able to connect to
++		// it is the authentication.
++		return true, true
+ 	case "js", "plan9":
+ 		return true, true
+ 	}
+diff --git a/net/netmon/interfaces_haiku.go b/net/netmon/interfaces_haiku.go
+new file mode 100644
+index 0000000..bbbd3c8
+--- /dev/null
++++ b/net/netmon/interfaces_haiku.go
+@@ -0,0 +1,64 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package netmon
++
++import (
++	"net"
++)
++
++// Go on Haiku has no interface enumeration: net.Interfaces returns an empty
++// list and a nil error. With no interfaces the monitor reports the network as
++// down, and netcheck then skips every STUN probe (it only probes address
++// families the interface state says exist), which leaves the node relay-only.
++//
++// Until the Go port grows a real implementation, ask the kernel which local
++// address it would use to reach a public destination. Connecting a UDP socket
++// performs that route lookup without sending a packet. The result is reported
++// as one synthetic interface per address family.
++func init() {
++	RegisterInterfaceGetter(haikuInterfaces)
++}
++
++// haikuProbes are the destinations used for the route lookup. Nothing is sent
++// to them.
++var haikuProbes = []struct {
++	network, dst string
++	bits         int
++}{
++	{"udp4", "1.1.1.1:53", 32},
++	{"udp6", "[2606:4700:4700::1111]:53", 128},
++}
++
++func haikuInterfaces() ([]Interface, error) {
++	var ret []Interface
++	for i, p := range haikuProbes {
++		c, err := net.Dial(p.network, p.dst)
++		if err != nil {
++			continue // no route for this address family
++		}
++		ua, ok := c.LocalAddr().(*net.UDPAddr)
++		c.Close()
++		if !ok || ua.IP.IsUnspecified() || ua.IP.IsLoopback() {
++			continue
++		}
++		name := "net4"
++		if p.bits == 128 {
++			name = "net6"
++		}
++		ret = append(ret, Interface{
++			Interface: &net.Interface{
++				Index: i + 1,
++				MTU:   1500,
++				Name:  name,
++				Flags: net.FlagUp | net.FlagRunning | net.FlagBroadcast | net.FlagMulticast,
++			},
++			// The prefix length is not known; a host route is the only
++			// claim that is certainly true.
++			AltAddrs: []net.Addr{&net.IPNet{IP: ua.IP, Mask: net.CIDRMask(p.bits, p.bits)}},
++		})
++	}
++	return ret, nil
++}
+diff --git a/net/tstun/tstun_stub.go b/net/tstun/tstun_stub.go
+index 27d530b..07eb4fd 100644
+--- a/net/tstun/tstun_stub.go
++++ b/net/tstun/tstun_stub.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build aix || solaris || illumos
++//go:build aix || solaris || illumos || haiku
+ 
+ package tstun
+ 
+diff --git a/net/tstun/tun.go b/net/tstun/tun.go
+index 42b0d23..d718c2c 100644
+--- a/net/tstun/tun.go
++++ b/net/tstun/tun.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !wasm && !tamago && !aix && !solaris && !illumos
++//go:build !wasm && !tamago && !aix && !solaris && !illumos && !haiku
+ 
+ // Package tun creates a tuntap device, working around OS-specific
+ // quirks if necessary.
+diff --git a/paths/access_haiku.go b/paths/access_haiku.go
+new file mode 100644
+index 0000000..99a91ed
+--- /dev/null
++++ b/paths/access_haiku.go
+@@ -0,0 +1,10 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package paths
++
++import "syscall"
++
++func accessReadWrite(path string) error { return syscall.Access(path, syscall.O_RDWR) }
+diff --git a/paths/access_other.go b/paths/access_other.go
+new file mode 100644
+index 0000000..b75bd4c
+--- /dev/null
++++ b/paths/access_other.go
+@@ -0,0 +1,10 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !haiku && !windows && !wasm && !plan9 && !tamago
++
++package paths
++
++import "golang.org/x/sys/unix"
++
++func accessReadWrite(path string) error { return unix.Access(path, unix.O_RDWR) }
+diff --git a/paths/paths.go b/paths/paths.go
+index 398d8b2..33984d4 100644
+--- a/paths/paths.go
++++ b/paths/paths.go
+@@ -31,6 +31,9 @@ func DefaultTailscaledSocket() string {
+ 	if runtime.GOOS == "plan9" {
+ 		return "/srv/tailscaled.sock"
+ 	}
++	if runtime.GOOS == "haiku" {
++		return "/boot/home/config/settings/tailscale/tailscaled.sock"
++	}
+ 	switch distro.Get() {
+ 	case distro.Synology:
+ 		if distro.DSMVersion() == 6 {
+@@ -92,7 +95,7 @@ func DefaultTailscaledStateDir() string {
+ // when it's absent.
+ func MakeAutomaticStateDir() bool {
+ 	switch runtime.GOOS {
+-	case "plan9":
++	case "plan9", "haiku":
+ 		return true
+ 	case "linux":
+ 		if distro.Get() == distro.JetKVM {
+diff --git a/paths/paths_unix.go b/paths/paths_unix.go
+index b1556b2..cce7038 100644
+--- a/paths/paths_unix.go
++++ b/paths/paths_unix.go
+@@ -11,7 +11,6 @@
+ 	"path/filepath"
+ 	"runtime"
+ 
+-	"golang.org/x/sys/unix"
+ 	"tailscale.com/version/distro"
+ )
+ 
+@@ -33,6 +32,8 @@ func statePath() string {
+ 		return "/Library/Tailscale/tailscaled.state"
+ 	case "aix":
+ 		return "/var/tailscale/tailscaled.state"
++	case "haiku":
++		return "/boot/home/config/settings/tailscale/tailscaled.state"
+ 	default:
+ 		return ""
+ 	}
+@@ -49,7 +50,7 @@ func stateFileUnix() string {
+ 
+ 	try := path
+ 	for range 3 { // check writability of the file, /var/lib/tailscale, and /var/lib
+-		err := unix.Access(try, unix.O_RDWR)
++		err := accessReadWrite(try)
+ 		if err == nil {
+ 			return path
+ 		}

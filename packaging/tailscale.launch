@@ -1,0 +1,9 @@
+# Start the Tailscale service. Installed as data/launch/tailscale: for a
+# package in ~/config/packages that directory is read by the user's
+# launch_daemon at login, for one in /system/packages by the system's at boot.
+# (data/user_launch is only read from /system, so a home install would be
+# ignored there.) The loop covers both install places; tailscaled-service
+# itself is what sets the daemon's flags.
+job x-vnd.rainygirl-tailscaled {
+	launch /bin/sh -c "for d in /boot/home/config/bin /boot/system/bin; do test -x $d/tailscaled-service && exec $d/tailscaled-service; done"
+}

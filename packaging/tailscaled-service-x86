@@ -1,0 +1,11 @@
+#!/bin/sh
+# tailscaled-service for the 32-bit package. On 32-bit x86 the daemon is not
+# started directly: the i386 port's launcher (tailscale-haiku, see i386/)
+# restarts it until a start succeeds, then runs "tailscale up" and waits for
+# the node to be Running. The launch job and R Tailscale's "Start service"
+# button call this name on every architecture.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+state_dir=${TS_STATE_DIR:-/boot/home/config/settings/tailscale}
+mkdir -p "$state_dir"
+exec "$here/tailscale-haiku" "$@" >"$state_dir/launcher.log" 2>&1

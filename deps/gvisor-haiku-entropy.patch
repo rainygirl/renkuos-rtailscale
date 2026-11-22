@@ -1,0 +1,17 @@
+--- a/pkg/tcpip/network/ipv4/ipv4.go
++++ b/pkg/tcpip/network/ipv4/ipv4.go
+@@ -58,7 +58,13 @@
+ 	DefaultTTL = 64
+ 
+ 	// buckets is the number of identifier buckets.
+-	buckets = 2048
++	//
++	// Reduced for Haiku. Each bucket is seeded from crypto/rand, so the
++	// upstream 2048 reads more than 8 KiB of entropy before the stack exists,
++	// and Haiku's getentropy can be very slow to produce that much: measured
++	// on RenkuOS/arm64, this one initialization held tailscaled's startup for
++	// 36 to 45 seconds. 64 buckets read 260 bytes.
++	buckets = 64
+ 
+ 	// The size of a fragment block, in bytes, as per RFC 791 section 3.1,
+ 	// page 14.

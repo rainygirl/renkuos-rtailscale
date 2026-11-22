@@ -1,0 +1,47 @@
+MIT License
+
+Copyright (c) 2026 Lee JunHaeng(rainygirl@gmail.com)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+SCOPE OF THIS LICENSE
+
+This MIT license covers the port's own material in this directory: the build
+and launcher scripts, the test reproducer, the documentation, and the patch
+files as authored works.
+
+It does NOT relicense the projects being patched. When a patch is applied, the
+resulting modified files remain under their upstream licenses:
+
+  - tailscale/tailscale ......... BSD-3-Clause, Copyright (c) Tailscale Inc &
+                                  contributors. See the LICENSE file in the
+                                  tailscale repository. Files added by
+                                  patches/0001-tailscale-haiku386.patch carry
+                                  Tailscale's SPDX headers and are contributed
+                                  under that same license.
+  - The Go programming language . BSD-3-Clause, Copyright (c) The Go Authors.
+                                  The go-runtime/*.patch files modify Go's
+                                  runtime; the modified files stay under Go's
+                                  license.
+  - gvisor, wireguard-go ........ their own licenses (Apache-2.0 and
+                                  BSD-3-Clause respectively).
+
+In short: the glue is MIT, the patched code keeps its upstream license.

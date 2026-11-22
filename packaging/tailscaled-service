@@ -1,0 +1,32 @@
+#!/bin/sh
+# Runs tailscaled the way this port expects: userspace networking (there is no
+# TUN device to hand it), state under ~/config/settings/tailscale, and the two
+# local proxies applications use to reach the tailnet.
+#
+# Started at login by the launch job in this package, and by R Tailscale's
+# "Start service" button. A second copy exits at once: tailscaled refuses to
+# start while another one owns the socket.
+#
+#   TS_SOCKS5_ADDR   default 127.0.0.1:1055
+#   TS_HTTP_ADDR     default 127.0.0.1:1056
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+state_dir=${TS_STATE_DIR:-/boot/home/config/settings/tailscale}
+mkdir -p "$state_dir"
+
+daemon=$here/tailscaled
+[ -x "$daemon" ] || daemon=tailscaled
+
+# Each start begins a new log; the previous one is kept once.
+log=$state_dir/tailscaled.log
+[ -f "$log" ] && mv -f "$log" "$log.1"
+
+exec "$daemon" \
+	--tun=userspace-networking \
+	--socket="$state_dir/tailscaled.sock" \
+	--state="$state_dir/tailscaled.state" \
+	--statedir="$state_dir" \
+	--socks5-server="${TS_SOCKS5_ADDR:-127.0.0.1:1055}" \
+	--outbound-http-proxy-listen="${TS_HTTP_ADDR:-127.0.0.1:1056}" \
+	>"$log" 2>&1

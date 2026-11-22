@@ -1,0 +1,33 @@
+diff --git a/conn/controlfns_unix.go b/conn/controlfns_unix.go
+--- a/conn/controlfns_unix.go
++++ b/conn/controlfns_unix.go
+@@ -1,4 +1,4 @@
+-//go:build !windows && !linux && !wasm && !plan9 && !tamago
++//go:build !windows && !linux && !wasm && !plan9 && !tamago && !haiku
+ 
+ /* SPDX-License-Identifier: MIT
+  *
+diff --git a/ipc/uapi_fake.go b/ipc/uapi_fake.go
+--- a/ipc/uapi_fake.go
++++ b/ipc/uapi_fake.go
+@@ -1,4 +1,4 @@
+-//go:build wasm || plan9 || aix || solaris || illumos
++//go:build wasm || plan9 || aix || solaris || illumos || haiku
+ 
+ /* SPDX-License-Identifier: MIT
+  *
+diff --git a/rwcancel/rwcancel.go b/rwcancel/rwcancel.go
+--- a/rwcancel/rwcancel.go
++++ b/rwcancel/rwcancel.go
+@@ -1,4 +1,4 @@
+-//go:build !windows && !wasm && !plan9 && !tamago
++//go:build !windows && !wasm && !plan9 && !tamago && !haiku
+ 
+ /* SPDX-License-Identifier: MIT
+  *
+diff --git a/rwcancel/rwcancel_stub.go b/rwcancel/rwcancel_stub.go
+--- a/rwcancel/rwcancel_stub.go
++++ b/rwcancel/rwcancel_stub.go
+@@ -1 +1 @@
+-//go:build windows || wasm || plan9 || tamago
++//go:build windows || wasm || plan9 || tamago || haiku

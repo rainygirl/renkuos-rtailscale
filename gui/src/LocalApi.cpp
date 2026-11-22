@@ -191,6 +191,8 @@ FetchStatus()
 		if (!ips.items.empty())
 			peer.ip = ips.items[0].Str();
 		peer.os = node["OS"].Str();
+		if (peer.os == "haiku")
+			peer.os = "RenkuOS";
 		peer.online = node["Online"].IsTrue();
 		peer.direct = !node["CurAddr"].Str().empty();
 		status.peers.push_back(peer);

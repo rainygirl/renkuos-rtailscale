@@ -55,8 +55,21 @@ index 1cc3ccb..8b07593 100644
  		if err != nil {
  			return ""
  		}
+diff --git a/cmd/tailscaled/ssh.go b/cmd/tailscaled/ssh.go
+index 8de3117..fe8acf5 100644
+--- a/cmd/tailscaled/ssh.go
++++ b/cmd/tailscaled/ssh.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux || darwin || freebsd || openbsd || plan9) && !ts_omit_ssh
++//go:build (linux || darwin || freebsd || openbsd || plan9 || haiku) && !ts_omit_ssh
+ 
+ package main
+ 
 diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
-index d7c19f5..10b8a8b 100644
+index d7c19f5..658973c 100644
 --- a/cmd/tailscaled/tailscaled.go
 +++ b/cmd/tailscaled/tailscaled.go
 @@ -80,7 +80,9 @@ func defaultTunName() string {
@@ -70,6 +83,54 @@ index d7c19f5..10b8a8b 100644
  		return "userspace-networking"
  	case "linux":
  		if buildfeatures.HasSynology && buildfeatures.HasNetstack && distro.Get() == distro.Synology {
+@@ -778,9 +780,10 @@ func handleSubnetsInNetstack() bool {
+ 		return true
+ 	}
+ 	switch runtime.GOOS {
+-	case "windows", "darwin", "freebsd", "openbsd", "solaris", "illumos":
++	case "windows", "darwin", "freebsd", "openbsd", "solaris", "illumos", "haiku":
+ 		// Enable on Windows and tailscaled-on-macOS (this doesn't
+-		// affect the GUI clients), and on FreeBSD.
++		// affect the GUI clients), and on FreeBSD. Haiku's IPv4 stack
++		// neither forwards nor translates addresses.
+ 		return true
+ 	}
+ 	return false
+@@ -843,7 +846,7 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
+ 			return false, err
+ 		}
+ 
+-		if runtime.GOOS == "plan9" {
++		if runtime.GOOS == "plan9" || runtime.GOOS == "haiku" {
+ 			// TODO(bradfitz): why don't we do this on all platforms?
+ 			// TODO(barnstar): we do it on sandboxed darwin now
+ 			// We should. Doing it just on plan9 for now conservatively.
+diff --git a/envknob/featureknob/featureknob.go b/envknob/featureknob/featureknob.go
+index 0493665..c612d2f 100644
+--- a/envknob/featureknob/featureknob.go
++++ b/envknob/featureknob/featureknob.go
+@@ -31,7 +31,7 @@ func CanRunTailscaleSSH() error {
+ 		if version.IsSandboxedMacOS() {
+ 			return errors.New("The Tailscale SSH server does not run in sandboxed Tailscale GUI builds.")
+ 		}
+-	case "freebsd", "openbsd", "plan9":
++	case "freebsd", "openbsd", "plan9", "haiku":
+ 	default:
+ 		return errors.New("The Tailscale SSH server is not supported on " + runtime.GOOS)
+ 	}
+diff --git a/feature/ssh/ssh.go b/feature/ssh/ssh.go
+index bd22005..696f7b9 100644
+--- a/feature/ssh/ssh.go
++++ b/feature/ssh/ssh.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build ((linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9) && !ts_omit_ssh
++//go:build ((linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9 || haiku) && !ts_omit_ssh
+ 
+ // Package ssh registers the Tailscale SSH feature, including host key
+ // management and the SSH server.
 diff --git a/ipn/ipnserver/server.go b/ipn/ipnserver/server.go
 index 19efaf9..662c98c 100644
 --- a/ipn/ipnserver/server.go
@@ -161,12 +222,77 @@ index 0000000..585596f
 +	resolvConf = "/boot/system/settings/network/resolv.conf"
 +	backupConf = "/boot/system/settings/network/resolv.pre-tailscale-backup.conf"
 +)
+diff --git a/net/dns/watchfile_haiku.go b/net/dns/watchfile_haiku.go
+new file mode 100644
+index 0000000..c6d5dc0
+--- /dev/null
++++ b/net/dns/watchfile_haiku.go
+@@ -0,0 +1,46 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package dns
++
++import (
++	"context"
++	"os"
++	"time"
++)
++
++// net_server rewrites resolv.conf whenever DHCP configures an interface,
++// including at every lease renewal, which silently drops the tailnet's
++// resolver. Watch the file so the manager notices and puts its own
++// configuration back, as it does on Linux with inotify. A stat every two
++// seconds is cheaper than it sounds and needs no node monitor port.
++func init() {
++	HookWatchFile.Set(watchFileByStat)
++}
++
++func watchFileByStat(ctx context.Context, _, filename string, cb func()) error {
++	t := time.NewTicker(2 * time.Second)
++	defer t.Stop()
++	last, _ := os.Stat(filename)
++	for {
++		select {
++		case <-ctx.Done():
++			return nil // closed; not worth a log line
++		case <-t.C:
++		}
++		cur, _ := os.Stat(filename)
++		if !sameFileState(last, cur) {
++			cb()
++		}
++		last = cur
++	}
++}
++
++func sameFileState(a, b os.FileInfo) bool {
++	if a == nil || b == nil {
++		return a == b
++	}
++	return os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
++}
+diff --git a/net/netmon/interfaces_defaultrouteif_todo.go b/net/netmon/interfaces_defaultrouteif_todo.go
+index 55d2841..b11871b 100644
+--- a/net/netmon/interfaces_defaultrouteif_todo.go
++++ b/net/netmon/interfaces_defaultrouteif_todo.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !linux && !windows && !darwin && !freebsd && !android && !openbsd
++//go:build !linux && !windows && !darwin && !freebsd && !android && !openbsd && !haiku
+ 
+ package netmon
+ 
 diff --git a/net/netmon/interfaces_haiku.go b/net/netmon/interfaces_haiku.go
 new file mode 100644
-index 0000000..bbbd3c8
+index 0000000..98422d8
 --- /dev/null
 +++ b/net/netmon/interfaces_haiku.go
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,334 @@
 +// Copyright (c) Tailscale Inc & contributors
 +// SPDX-License-Identifier: BSD-3-Clause
 +
@@ -175,61 +301,787 @@ index 0000000..bbbd3c8
 +package netmon
 +
 +import (
++	"bytes"
++	"encoding/binary"
++	"errors"
 +	"net"
++	"net/netip"
++	"runtime"
++	"syscall"
++	"unsafe"
 +)
 +
 +// Go on Haiku has no interface enumeration: net.Interfaces returns an empty
 +// list and a nil error. With no interfaces the monitor reports the network as
-+// down, and netcheck then skips every STUN probe (it only probes address
-+// families the interface state says exist), which leaves the node relay-only.
-+//
-+// Until the Go port grows a real implementation, ask the kernel which local
-+// address it would use to reach a public destination. Connecting a UDP socket
-+// performs that route lookup without sending a packet. The result is reported
-+// as one synthetic interface per address family.
++// down, and netcheck then skips every STUN probe, which leaves the node
++// relay-only. So the interfaces are read here with the ioctls Haiku's own
++// ifconfig uses.
 +func init() {
 +	RegisterInterfaceGetter(haikuInterfaces)
 +}
 +
-+// haikuProbes are the destinations used for the route lookup. Nothing is sent
-+// to them.
-+var haikuProbes = []struct {
-+	network, dst string
-+	bits         int
-+}{
-+	{"udp4", "1.1.1.1:53", 32},
-+	{"udp6", "[2606:4700:4700::1111]:53", 128},
++// From <sys/sockio.h>, <net/if.h>, <net/route.h>.
++const (
++	siocGIFFLAGS     = 8907
++	siocGIFCONF      = 8911
++	siocGIFINDEX     = 8912
++	siocGIFMTU       = 8922
++	siocGRTSIZE      = 8926
++	siocGRTTABLE     = 8927
++	sockGetAlias     = 8948 // B_SOCKET_GET_ALIAS
++	sockCountAliases = 8949 // B_SOCKET_COUNT_ALIASES
++
++	iffUp        = 0x0001
++	iffBroadcast = 0x0002
++	iffLoopback  = 0x0008
++	iffPtP       = 0x0010
++	iffLink      = 0x1000 // the device has link
++	iffMulticast = 0x8000
++
++	ifNameSize = 32
++	// sizeof(struct ifreq): the name and a union whose largest member is
++	// struct ifreq_stats (56 bytes).
++	ifreqSize = ifNameSize + 56
++	// sizeof(struct route_entry): four pointers, flags and mtu.
++	routeEntrySize = 4*8 + 4 + 4
++)
++
++type ifreq [ifreqSize]byte
++
++func newIfreq(name string) *ifreq {
++	var r ifreq
++	copy(r[:ifNameSize-1], name)
++	return &r
++}
++
++func (r *ifreq) int32() int32 {
++	return int32(binary.LittleEndian.Uint32(r[ifNameSize:]))
++}
++
++// struct ifaliasreq: name, int index, then three sockaddr_storage (128 bytes,
++// 8-aligned) and the flags.
++type ifaliasreq [ifNameSize + 8 + 3*128 + 8]byte
++
++const (
++	aliasIndexOff = ifNameSize
++	aliasAddrOff  = ifNameSize + 8
++	aliasMaskOff  = aliasAddrOff + 2*128
++)
++
++func haikuSocket() (int, error) {
++	return syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
++}
++
++// haikuInterfaceNames lists the interfaces with SIOCGIFCONF. Each record is
++// the name, the interface's first address (with its own length), padded to
++// at least sizeof(struct ifreq).
++func haikuInterfaceNames(fd int) ([]string, error) {
++	buf := make([]byte, 64*ifreqSize)
++	var conf struct {
++		len int32
++		_   int32
++		buf unsafe.Pointer
++	}
++	conf.len = int32(len(buf))
++	conf.buf = unsafe.Pointer(&buf[0])
++	err := ioctl(fd, siocGIFCONF, unsafe.Pointer(&conf), unsafe.Sizeof(conf))
++	runtime.KeepAlive(buf)
++	if err != nil {
++		return nil, err
++	}
++	b := buf[:conf.len]
++	var names []string
++	for len(b) >= ifNameSize+2 {
++		name := string(b[:bytes.IndexByte(append(b[:ifNameSize:ifNameSize], 0), 0)])
++		n := ifNameSize + int(b[ifNameSize])
++		if n < ifreqSize {
++			n = ifreqSize
++		}
++		if n > len(b) {
++			n = len(b)
++		}
++		b = b[n:]
++		if name != "" {
++			names = append(names, name)
++		}
++	}
++	return names, nil
++}
++
++// sockaddrIP decodes a sockaddr_in or sockaddr_in6.
++func sockaddrIP(sa []byte) (netip.Addr, bool) {
++	if len(sa) < 2 {
++		return netip.Addr{}, false
++	}
++	switch sa[1] {
++	case syscall.AF_INET:
++		if len(sa) >= 8 {
++			return netip.AddrFrom4([4]byte(sa[4:8])), true
++		}
++	case syscall.AF_INET6:
++		if len(sa) >= 24 {
++			return netip.AddrFrom16([16]byte(sa[8:24])), true
++		}
++	}
++	return netip.Addr{}, false
++}
++
++// maskBits converts a netmask sockaddr into a prefix length.
++func maskBits(sa []byte, family byte, bits int) int {
++	m, ok := sockaddrIP(sa)
++	if !ok || sa[1] != family {
++		return bits
++	}
++	ones, total := net.IPMask(m.AsSlice()).Size()
++	if total == 0 {
++		return bits // not a contiguous mask
++	}
++	return ones
++}
++
++func haikuInterface(fd int, name string) (Interface, error) {
++	ni := &net.Interface{Name: name}
++
++	r := newIfreq(name)
++	if err := ioctl(fd, siocGIFINDEX, unsafe.Pointer(r), ifreqSize); err != nil {
++		return Interface{}, err
++	}
++	ni.Index = int(r.int32())
++
++	r = newIfreq(name)
++	if err := ioctl(fd, siocGIFFLAGS, unsafe.Pointer(r), ifreqSize); err != nil {
++		return Interface{}, err
++	}
++	flags := r.int32()
++	// An interface is only usable while its device has link: report it
++	// down otherwise, so that losing the link is seen as a change.
++	if flags&iffUp != 0 && (flags&iffLink != 0 || flags&iffLoopback != 0) {
++		ni.Flags |= net.FlagUp | net.FlagRunning
++	}
++	if flags&iffBroadcast != 0 {
++		ni.Flags |= net.FlagBroadcast
++	}
++	if flags&iffLoopback != 0 {
++		ni.Flags |= net.FlagLoopback
++	}
++	if flags&iffPtP != 0 {
++		ni.Flags |= net.FlagPointToPoint
++	}
++	if flags&iffMulticast != 0 {
++		ni.Flags |= net.FlagMulticast
++	}
++
++	r = newIfreq(name)
++	if ioctl(fd, siocGIFMTU, unsafe.Pointer(r), ifreqSize) == nil {
++		ni.MTU = int(r.int32())
++	}
++
++	r = newIfreq(name)
++	if err := ioctl(fd, sockCountAliases, unsafe.Pointer(r), ifreqSize); err != nil {
++		return Interface{}, err
++	}
++	count := int(r.int32())
++	addrs := []net.Addr{} // non-nil: Interface.Addrs must not ask net
++	for i := range count {
++		var a ifaliasreq
++		copy(a[:ifNameSize-1], name)
++		binary.LittleEndian.PutUint32(a[aliasIndexOff:], uint32(i))
++		if ioctl(fd, sockGetAlias, unsafe.Pointer(&a), unsafe.Sizeof(a)) != nil {
++			continue // removed meanwhile
++		}
++		ip, ok := sockaddrIP(a[aliasAddrOff : aliasAddrOff+128])
++		if !ok || ip.IsUnspecified() {
++			continue
++		}
++		bits := maskBits(a[aliasMaskOff:aliasMaskOff+128], a[aliasAddrOff+1], ip.BitLen())
++		addrs = append(addrs, &net.IPNet{IP: ip.AsSlice(), Mask: net.CIDRMask(bits, ip.BitLen())})
++	}
++	return Interface{Interface: ni, AltAddrs: addrs}, nil
 +}
 +
 +func haikuInterfaces() ([]Interface, error) {
++	fd, err := haikuSocket()
++	if err != nil {
++		return nil, err
++	}
++	defer syscall.Close(fd)
++	names, err := haikuInterfaceNames(fd)
++	if err != nil {
++		return nil, err
++	}
 +	var ret []Interface
-+	for i, p := range haikuProbes {
-+		c, err := net.Dial(p.network, p.dst)
++	for _, name := range names {
++		ifc, err := haikuInterface(fd, name)
 +		if err != nil {
-+			continue // no route for this address family
++			continue // removed while we were looking
 +		}
-+		ua, ok := c.LocalAddr().(*net.UDPAddr)
-+		c.Close()
-+		if !ok || ua.IP.IsUnspecified() || ua.IP.IsLoopback() {
-+			continue
-+		}
-+		name := "net4"
-+		if p.bits == 128 {
-+			name = "net6"
-+		}
-+		ret = append(ret, Interface{
-+			Interface: &net.Interface{
-+				Index: i + 1,
-+				MTU:   1500,
-+				Name:  name,
-+				Flags: net.FlagUp | net.FlagRunning | net.FlagBroadcast | net.FlagMulticast,
-+			},
-+			// The prefix length is not known; a host route is the only
-+			// claim that is certainly true.
-+			AltAddrs: []net.Addr{&net.IPNet{IP: ua.IP, Mask: net.CIDRMask(p.bits, p.bits)}},
-+		})
++		ret = append(ret, ifc)
 +	}
 +	return ret, nil
++}
++
++// defaultRoute returns the interface of the IPv4 default route, or failing
++// that the IPv6 one, ignoring the Tailscale interface.
++func defaultRoute() (DefaultRouteDetails, error) {
++	tsIf, _ := TailscaleInterfaceName()
++	for _, family := range []int{syscall.AF_INET, syscall.AF_INET6} {
++		name, err := haikuDefaultRouteIf(family, tsIf)
++		if err != nil || name == "" {
++			continue
++		}
++		d := DefaultRouteDetails{InterfaceName: name}
++		if fd, err := haikuSocket(); err == nil {
++			r := newIfreq(name)
++			if ioctl(fd, siocGIFINDEX, unsafe.Pointer(r), ifreqSize) == nil {
++				d.InterfaceIndex = int(r.int32())
++			}
++			syscall.Close(fd)
++		}
++		return d, nil
++	}
++	return DefaultRouteDetails{}, errNoDefaultRoute
++}
++
++var errNoDefaultRoute = errors.New("no default route")
++
++// haikuDefaultRouteIf reads the routing table of one address family with
++// SIOCGRTTABLE. Each record is the interface name and a struct route_entry,
++// followed by the destination, mask and gateway sockaddrs its pointers point
++// to, in that order, each present only if its pointer is set.
++func haikuDefaultRouteIf(family int, tsIf string) (string, error) {
++	fd, err := syscall.Socket(family, syscall.SOCK_DGRAM, 0)
++	if err != nil {
++		return "", err
++	}
++	defer syscall.Close(fd)
++
++	var conf struct {
++		len int32
++		_   int32
++		buf unsafe.Pointer
++	}
++	if err := ioctl(fd, siocGRTSIZE, unsafe.Pointer(&conf), unsafe.Sizeof(conf)); err != nil {
++		return "", err
++	}
++	size := int(*(*int32)(unsafe.Pointer(&conf.buf)))
++	if size <= 0 {
++		return "", nil
++	}
++	buf := make([]byte, size+16*(ifNameSize+routeEntrySize+3*32)) // room for a route added meanwhile
++	conf.len = int32(len(buf))
++	conf.buf = unsafe.Pointer(&buf[0])
++	err = ioctl(fd, siocGRTTABLE, unsafe.Pointer(&conf), unsafe.Sizeof(conf))
++	runtime.KeepAlive(buf)
++	if err != nil {
++		return "", err
++	}
++
++	b := buf
++	for len(b) >= ifNameSize+routeEntrySize {
++		name := string(b[:bytes.IndexByte(append(b[:ifNameSize:ifNameSize], 0), 0)])
++		if name == "" {
++			break // end of the table: the rest of the buffer is zero
++		}
++		e := b[ifNameSize:]
++		le := binary.LittleEndian
++		hasDst, hasMask, hasGw := le.Uint64(e[0:]) != 0, le.Uint64(e[8:]) != 0, le.Uint64(e[16:]) != 0
++		rest := b[ifNameSize+routeEntrySize:]
++		next := func() []byte {
++			if len(rest) < 1 || int(rest[0]) > len(rest) || rest[0] == 0 {
++				rest = nil
++				return nil
++			}
++			sa := rest[:rest[0]]
++			rest = rest[rest[0]:]
++			return sa
++		}
++		var dst, mask []byte
++		if hasDst {
++			dst = next()
++		}
++		if hasMask {
++			mask = next()
++		}
++		if hasGw {
++			next()
++		}
++		if rest == nil {
++			break
++		}
++		b = rest
++
++		if name == tsIf {
++			continue
++		}
++		// A default route has an unspecified (or no) destination and a
++		// zero-length (or no) mask.
++		if ip, ok := sockaddrIP(dst); dst != nil && (!ok || !ip.IsUnspecified()) {
++			continue
++		}
++		if mask != nil {
++			if m, ok := sockaddrIP(mask); ok && !m.IsUnspecified() {
++				continue
++			}
++		}
++		return name, nil
++	}
++	return "", nil
++}
+diff --git a/net/netmon/netmon_haiku.go b/net/netmon/netmon_haiku.go
+new file mode 100644
+index 0000000..d2484d5
+--- /dev/null
++++ b/net/netmon/netmon_haiku.go
+@@ -0,0 +1,113 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package netmon
++
++import (
++	"errors"
++	"sync"
++	"time"
++	"unsafe"
++
++	"tailscale.com/types/logger"
++	"tailscale.com/util/eventbus"
++)
++
++// The network stack's notification module (<net/NetworkNotifications.h>,
++// private/net/net_notifications.h) sends a message to a port whenever an
++// interface is added, removed or changed (addresses, flags) and when a
++// device's link goes up or down. BNetworkRoster users subscribe through
++// start_watching_network(), a thin wrapper around this generic syscall.
++const (
++	netNotificationsSyscalls = "network/notifications"
++	netNotificationsWatching = 1
++
++	watchInterfaceChanges = 0x000f // B_WATCH_NETWORK_INTERFACE_CHANGES
++	watchLinkChanges      = 0x00f0 // B_WATCH_NETWORK_LINK_CHANGES
++)
++
++// haikuPollInterval is how often the state is checked without a
++// notification. Routes have no notifications (a default route that moves to
++// another interface is only seen this way), and if subscribing fails this is
++// the only source.
++const haikuPollInterval = 5 * time.Second
++
++func newOSMon(_ *eventbus.Bus, logf logger.Logf, m *Monitor) (osMon, error) {
++	hm := &haikuMon{logf: logf, port: -1, stop: make(chan struct{}), events: make(chan struct{}, 1)}
++	port, err := createPort(16, "tailscale netmon")
++	if err == nil {
++		ctl := struct {
++			flags uint32
++			port  int32
++			token uint32
++		}{watchInterfaceChanges | watchLinkChanges, port, 0}
++		err = genericSyscall(netNotificationsSyscalls, netNotificationsWatching,
++			unsafe.Pointer(&ctl), unsafe.Sizeof(ctl))
++		if err != nil {
++			deletePort(port)
++		} else {
++			hm.port = port
++			go hm.readPort()
++		}
++	}
++	if err != nil {
++		logf("network notifications unavailable, polling only: %v", err)
++	}
++	return hm, nil
++}
++
++type haikuMon struct {
++	logf   logger.Logf
++	port   int32 // -1 if not subscribed
++	events chan struct{}
++
++	closeOnce sync.Once
++	stop      chan struct{}
++}
++
++// readPort turns each notification into a wakeup. The messages are not
++// decoded: the monitor compares the whole state anyway, and a burst of them
++// (an interface going down drops several addresses) collapses into one.
++func (hm *haikuMon) readPort() {
++	buf := make([]byte, 4096)
++	for {
++		if _, err := readPort(hm.port, buf); err != nil {
++			return // the port was deleted by Close
++		}
++		select {
++		case hm.events <- struct{}{}:
++		default:
++		}
++	}
++}
++
++func (hm *haikuMon) Close() error {
++	hm.closeOnce.Do(func() {
++		close(hm.stop)
++		if hm.port >= 0 {
++			// Ends the subscription as well: the stack drops listeners
++			// whose port is gone.
++			deletePort(hm.port)
++		}
++	})
++	return nil
++}
++
++func (hm *haikuMon) Receive() (message, error) {
++	t := time.NewTimer(haikuPollInterval)
++	defer t.Stop()
++	select {
++	case <-hm.events:
++	case <-t.C:
++	case <-hm.stop:
++		return nil, errors.New("stopped")
++	}
++	return unspecifiedMessage{}, nil
++}
++
++// unspecifiedMessage is a wakeup that makes the monitor re-read the state.
++type unspecifiedMessage struct{}
++
++func (unspecifiedMessage) ignore() bool { return false }
+diff --git a/net/netmon/netmon_polling.go b/net/netmon/netmon_polling.go
+index bdeb430..ea05e61 100644
+--- a/net/netmon/netmon_polling.go
++++ b/net/netmon/netmon_polling.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (!linux && !freebsd && !windows && !darwin) || android
++//go:build (!linux && !freebsd && !windows && !darwin && !haiku) || android
+ 
+ package netmon
+ 
+diff --git a/net/netmon/sys_haiku.go b/net/netmon/sys_haiku.go
+new file mode 100644
+index 0000000..7b14b09
+--- /dev/null
++++ b/net/netmon/sys_haiku.go
+@@ -0,0 +1,97 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package netmon
++
++import (
++	"syscall"
++	"unsafe"
++)
++
++// Haiku has no netlink or routing socket, and Go's syscall package for
++// Haiku offers neither ioctl nor ports. Both are plain functions in
++// libroot.so, which every Go binary on Haiku already links against, so they
++// are called the way golang.org/x/sys/unix calls libc on Solaris: through
++// syscall's sysvicall6, without cgo.
++
++//go:cgo_import_dynamic libc___ioctl __ioctl "libroot.so"
++//go:cgo_import_dynamic libc_create_port create_port "libroot.so"
++//go:cgo_import_dynamic libc_read_port_etc read_port_etc "libroot.so"
++//go:cgo_import_dynamic libc_delete_port delete_port "libroot.so"
++//go:cgo_import_dynamic libc__kern_generic_syscall _kern_generic_syscall "libroot.so"
++
++//go:linkname libc___ioctl libc___ioctl
++//go:linkname libc_create_port libc_create_port
++//go:linkname libc_read_port_etc libc_read_port_etc
++//go:linkname libc_delete_port libc_delete_port
++//go:linkname libc__kern_generic_syscall libc__kern_generic_syscall
++
++var (
++	libc___ioctl,
++	libc_create_port,
++	libc_read_port_etc,
++	libc_delete_port,
++	libc__kern_generic_syscall libcFunc
++)
++
++type libcFunc uintptr
++
++//go:linkname sysvicall6 syscall.sysvicall6
++func sysvicall6(fn, nargs, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall.Errno)
++
++func (f *libcFunc) call(nargs uintptr, a ...uintptr) (uintptr, syscall.Errno) {
++	var v [6]uintptr
++	copy(v[:], a)
++	r, _, e := sysvicall6(uintptr(unsafe.Pointer(f)), nargs, v[0], v[1], v[2], v[3], v[4], v[5])
++	return r, e
++}
++
++// ioctl calls __ioctl(fd, op, arg, size), which returns -1 and sets errno
++// on failure.
++func ioctl(fd int, op uintptr, arg unsafe.Pointer, size uintptr) error {
++	r, e := libc___ioctl.call(4, uintptr(fd), op, uintptr(arg), size)
++	if int32(r) == -1 {
++		return e
++	}
++	return nil
++}
++
++// Kernel calls return a negative status_t on failure.
++type haikuStatus int32
++
++func (s haikuStatus) Error() string { return syscall.Errno(s).Error() }
++
++func status(r uintptr) error {
++	if int32(r) < 0 {
++		return haikuStatus(int32(r))
++	}
++	return nil
++}
++
++func createPort(capacity int32, name string) (int32, error) {
++	b := append([]byte(name), 0)
++	r, _ := libc_create_port.call(2, uintptr(capacity), uintptr(unsafe.Pointer(&b[0])))
++	return int32(r), status(r)
++}
++
++// readPort blocks until a message arrives or the port is deleted.
++func readPort(port int32, buf []byte) (int, error) {
++	var code int32
++	r, _ := libc_read_port_etc.call(6, uintptr(port), uintptr(unsafe.Pointer(&code)),
++		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0, 0)
++	return int(int32(r)), status(r)
++}
++
++func deletePort(port int32) error {
++	r, _ := libc_delete_port.call(1, uintptr(port))
++	return status(r)
++}
++
++func genericSyscall(subsystem string, function uint32, buf unsafe.Pointer, size uintptr) error {
++	b := append([]byte(subsystem), 0)
++	r, _ := libc__kern_generic_syscall.call(4, uintptr(unsafe.Pointer(&b[0])),
++		uintptr(function), uintptr(buf), size)
++	return status(r)
++}
+diff --git a/net/netns/netns_default.go b/net/netns/netns_default.go
+index 33f4c13..cc967eb 100644
+--- a/net/netns/netns_default.go
++++ b/net/netns/netns_default.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !linux && !windows && !darwin && !openbsd
++//go:build !linux && !windows && !darwin && !openbsd && !haiku
+ 
+ package netns
+ 
+diff --git a/net/netns/netns_haiku.go b/net/netns/netns_haiku.go
+new file mode 100644
+index 0000000..c96ce7c
+--- /dev/null
++++ b/net/netns/netns_haiku.go
+@@ -0,0 +1,202 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package netns
++
++import (
++	"fmt"
++	"net"
++	"net/netip"
++	"os/exec"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"syscall"
++
++	"tailscale.com/net/netmon"
++	"tailscale.com/types/logger"
++)
++
++// Haiku has one routing table, no policy routing and no socket marks, and
++// SO_BINDTODEVICE sends straight onto the link without a gateway. So when
++// an exit node is in use and the default route points into the tunnel,
++// tailscaled's own traffic (control, DERP, STUN, WireGuard to peers) is kept
++// out of it with host routes through the physical gateway: one for each
++// remote address tailscaled talks to, added before the first packet goes
++// out. The router turns this on with SetupBypass when it installs the
++// default route and off with CleanupBypass, which removes those routes.
++
++type haikuBypass struct {
++	logf   logger.Logf
++	ifname string         // physical interface, e.g. /dev/net/virtio/0
++	gw     netip.Addr     // its default gateway
++	lan    []netip.Prefix // on-link prefixes, which need no host route
++	pinned sync.Map       // netip.Addr -> bool (true: host route added)
++}
++
++var (
++	bypassMu sync.Mutex // serializes setup, cleanup and route additions
++	bypass   atomic.Pointer[haikuBypass]
++
++	// dialed records the remote addresses dialed through this package, so
++	// that connections made before SetupBypass get their routes too.
++	dialed sync.Map // netip.Addr -> struct{}
++)
++
++func control(logf logger.Logf, _ *netmon.Monitor) func(network, address string, c syscall.RawConn) error {
++	return controlC
++}
++
++// controlC pins the remote address of a dial. For a listen the address is
++// the local one and pins nothing.
++func controlC(network, address string, c syscall.RawConn) error {
++	if isLocalhost(address) {
++		return nil
++	}
++	if ap, err := netip.ParseAddrPort(address); err == nil {
++		a := ap.Addr().Unmap()
++		if a.Is4() && !a.IsUnspecified() {
++			dialed.Store(a, struct{}{})
++			PinBypassRoute(a)
++		}
++	}
++	return nil
++}
++
++func UseSocketMark() bool {
++	return false
++}
++
++// PinBypassRoute makes sure that packets to a are routed through the
++// physical gateway while the default route goes through the tunnel. It
++// does nothing otherwise, and costs one atomic load then.
++func PinBypassRoute(a netip.Addr) {
++	b := bypass.Load()
++	if b == nil || !a.Is4() {
++		return
++	}
++	if _, ok := b.pinned.Load(a); ok {
++		return
++	}
++	bypassMu.Lock()
++	defer bypassMu.Unlock()
++	if bypass.Load() != b {
++		return // cleaned up meanwhile
++	}
++	if _, ok := b.pinned.Load(a); ok {
++		return
++	}
++	if !b.needsRoute(a) {
++		b.pinned.Store(a, false)
++		return
++	}
++	err := haikuRoute("add", b.ifname, a.String(), "netmask", "255.255.255.255", "gw", b.gw.String())
++	if err != nil {
++		b.logf("netns: %v", err)
++	}
++	// Stored on failure too: retrying on every packet would not help.
++	b.pinned.Store(a, err == nil)
++}
++
++func (b *haikuBypass) needsRoute(a netip.Addr) bool {
++	if a.IsLoopback() || a.IsMulticast() || a.IsLinkLocalUnicast() || a == b.gw {
++		return false
++	}
++	// Tailscale's own range (100.64.0.0/10) is the tunnel's business.
++	if netip.MustParsePrefix("100.64.0.0/10").Contains(a) {
++		return false
++	}
++	for _, p := range b.lan {
++		if p.Contains(a) {
++			return false
++		}
++	}
++	return true
++}
++
++// haikuRoute runs Haiku's route command. route prints its errors but exits
++// with status 0, so its output is what tells.
++func haikuRoute(args ...string) error {
++	out, err := exec.Command("route", args...).CombinedOutput()
++	if err == nil && strings.Contains(string(out), "Could not") {
++		err = fmt.Errorf("failed")
++	}
++	if err != nil {
++		return fmt.Errorf("route %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
++	}
++	return nil
++}
++
++// SetupBypass is called by the router before it routes the default route
++// through the tun interface tunname. It finds the current default gateway
++// and pins every address tailscaled has dialed so far.
++func SetupBypass(logf logger.Logf, tunname string) error {
++	bypassMu.Lock()
++	if bypass.Load() != nil {
++		bypassMu.Unlock()
++		return nil
++	}
++	out, err := exec.Command("route", "list", "inet").CombinedOutput()
++	if err != nil {
++		bypassMu.Unlock()
++		return fmt.Errorf("route list: %v", err)
++	}
++	b := &haikuBypass{logf: logf}
++	// Lines are: destination netmask gateway flags interface; the gateway is
++	// "-" for an on-link route.
++	for _, line := range strings.Split(string(out), "\n") {
++		f := strings.Fields(line)
++		if len(f) != 5 || f[4] == tunname || strings.HasPrefix(f[4], "tun/") || f[4] == "loop" {
++			continue
++		}
++		dst, err1 := netip.ParseAddr(f[0])
++		mask := net.ParseIP(f[1]).To4()
++		if err1 != nil || mask == nil {
++			continue
++		}
++		bits, _ := net.IPMask(mask).Size()
++		gw, err2 := netip.ParseAddr(f[2])
++		switch {
++		case bits == 0 && err2 == nil && !b.gw.IsValid():
++			b.ifname, b.gw = f[4], gw
++		case bits > 0 && err2 != nil:
++			b.lan = append(b.lan, netip.PrefixFrom(dst, bits).Masked())
++		}
++	}
++	if !b.gw.IsValid() {
++		bypassMu.Unlock()
++		return fmt.Errorf("no default gateway outside the tunnel in %q", out)
++	}
++	bypass.Store(b)
++	bypassMu.Unlock()
++	logf("netns: tailscaled's own traffic bypasses the tunnel via %v on %s (on-link: %v)", b.gw, b.ifname, b.lan)
++
++	dialed.Range(func(k, _ any) bool {
++		PinBypassRoute(k.(netip.Addr))
++		return true
++	})
++	return nil
++}
++
++// CleanupBypass removes the host routes added since SetupBypass.
++func CleanupBypass(logf logger.Logf) {
++	bypassMu.Lock()
++	defer bypassMu.Unlock()
++	b := bypass.Swap(nil)
++	if b == nil {
++		return
++	}
++	n := 0
++	b.pinned.Range(func(k, v any) bool {
++		if v.(bool) {
++			if err := haikuRoute("delete", b.ifname, k.(netip.Addr).String(), "netmask", "255.255.255.255", "gw", b.gw.String()); err != nil {
++				logf("netns: %v", err)
++			}
++			n++
++		}
++		return true
++	})
++	logf("netns: bypass via %v removed (%d host routes)", b.gw, n)
 +}
 diff --git a/paths/access_haiku.go b/paths/access_haiku.go
 new file mode 100644
@@ -316,12 +1168,641 @@ index b1556b2..cce7038 100644
  		if err == nil {
  			return path
  		}
+diff --git a/ssh/tailssh/c2n.go b/ssh/tailssh/c2n.go
+index 621be74..eb0d38b 100644
+--- a/ssh/tailssh/c2n.go
++++ b/ssh/tailssh/c2n.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9 || haiku
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/hostkeys.go b/ssh/tailssh/hostkeys.go
+index 8046a02..56ce8c8 100644
+--- a/ssh/tailssh/hostkeys.go
++++ b/ssh/tailssh/hostkeys.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9 || haiku
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/incubator.go b/ssh/tailssh/incubator.go
+index 48c65e8..f817b91 100644
+--- a/ssh/tailssh/incubator.go
++++ b/ssh/tailssh/incubator.go
+@@ -7,7 +7,7 @@
+ // and groups to the specified `--uid`, `--gid` and `--groups`, and
+ // then launches the requested `--cmd`.
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd
++//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || haiku
+ 
+ package tailssh
+ 
+@@ -33,12 +33,9 @@
+ 	"syscall"
+ 	"time"
+ 
+-	"github.com/creack/pty"
+ 	"github.com/pkg/sftp"
+ 	gliderssh "github.com/tailscale/gliderssh"
+-	"github.com/u-root/u-root/pkg/termios"
+ 	"golang.org/x/crypto/ssh"
+-	"golang.org/x/sys/unix"
+ 	"tailscale.com/cmd/tailscaled/childproc"
+ 	"tailscale.com/hostinfo"
+ 	"tailscale.com/tailcfg"
+@@ -52,6 +49,7 @@
+ 	freebsd = "freebsd"
+ 	openbsd = "openbsd"
+ 	windows = "windows"
++	haiku   = "haiku"
+ )
+ 
+ func init() {
+@@ -485,6 +483,13 @@ func shouldAttemptLoginShell(dlogf logger.Logf, ia incubatorArgs) bool {
+ 		return false
+ 	}
+ 
++	if runtime.GOOS == haiku {
++		// Haiku's login and su do not take the arguments used here (and
++		// there is no PAM); the shell is started in-process.
++		dlogf("won't use login or su on haiku")
++		return false
++	}
++
+ 	return runningAsRoot() && !ia.isSELinuxEnforcing
+ }
+ 
+@@ -545,7 +550,7 @@ func tryExecLogin(dlogf logger.Logf, ia incubatorArgs) error {
+ 	}
+ 
+ 	// If Exec works, the Go code will not proceed past this:
+-	err = unix.Exec(loginCmdPath, loginArgs, environ)
++	err = execve(loginCmdPath, loginArgs, environ)
+ 
+ 	// If we made it here, Exec failed.
+ 	return err
+@@ -597,7 +602,7 @@ func trySU(dlogf logger.Logf, ia incubatorArgs) (handled bool, err error) {
+ 	dlogf("logging in with %+v", loginArgs)
+ 
+ 	// If Exec works, the Go code will not proceed past this:
+-	err = unix.Exec(su, loginArgs, environ)
++	err = execve(su, loginArgs, environ)
+ 
+ 	// If we made it here, Exec failed.
+ 	return true, err
+@@ -899,12 +904,7 @@ func (ss *sshSession) launchProcess() error {
+ 
+ func resizeWindow(fd int, winCh <-chan gliderssh.Window) {
+ 	for win := range winCh {
+-		unix.IoctlSetWinsize(fd, syscall.TIOCSWINSZ, &unix.Winsize{
+-			Row:    uint16(win.Height),
+-			Col:    uint16(win.Width),
+-			Xpixel: uint16(win.WidthPixels),
+-			Ypixel: uint16(win.HeightPixels),
+-		})
++		setWinsize(fd, win)
+ 	}
+ }
+ 
+@@ -981,7 +981,7 @@ func (ss *sshSession) startWithPTY() (ptyFile, tty *os.File, err error) {
+ 		return nil, nil, errors.New("nil ss.ptyReq")
+ 	}
+ 
+-	ptyFile, tty, err = pty.Open()
++	ptyFile, tty, err = openPTY()
+ 	if err != nil {
+ 		err = fmt.Errorf("pty.Open: %w", err)
+ 		return
+@@ -998,48 +998,7 @@ func (ss *sshSession) startWithPTY() (ptyFile, tty *os.File, err error) {
+ 	}
+ 	var ctlErr error
+ 	if err := ptyRawConn.Control(func(fd uintptr) {
+-		// Load existing PTY settings to modify them & save them back.
+-		tios, err := termios.GTTY(int(fd))
+-		if err != nil {
+-			ctlErr = fmt.Errorf("GTTY: %w", err)
+-			return
+-		}
+-
+-		// Set the rows & cols to those advertised from the ptyReq frame
+-		// received over SSH.
+-		tios.Row = int(ptyReq.Window.Height)
+-		tios.Col = int(ptyReq.Window.Width)
+-
+-		for c, v := range ptyReq.Modes {
+-			if c == ssh.TTY_OP_ISPEED {
+-				tios.Ispeed = int(v)
+-				continue
+-			}
+-			if c == ssh.TTY_OP_OSPEED {
+-				tios.Ospeed = int(v)
+-				continue
+-			}
+-			k, ok := opcodeShortName[c]
+-			if !ok {
+-				ss.vlogf("unknown opcode: %d", c)
+-				continue
+-			}
+-			if _, ok := tios.CC[k]; ok {
+-				tios.CC[k] = uint8(v)
+-				continue
+-			}
+-			if _, ok := tios.Opts[k]; ok {
+-				tios.Opts[k] = v > 0
+-				continue
+-			}
+-			ss.vlogf("unsupported opcode: %v(%d)=%v", k, c, v)
+-		}
+-
+-		// Save PTY settings.
+-		if _, err := tios.STTY(int(fd)); err != nil {
+-			ctlErr = fmt.Errorf("STTY: %w", err)
+-			return
+-		}
++		ctlErr = applyPTYModes(int(fd), ptyReq, ss.vlogf)
+ 	}); err != nil {
+ 		return nil, nil, fmt.Errorf("ptyRawConn.Control: %w", err)
+ 	}
+diff --git a/ssh/tailssh/incubator_haiku.go b/ssh/tailssh/incubator_haiku.go
+new file mode 100644
+index 0000000..60e41be
+--- /dev/null
++++ b/ssh/tailssh/incubator_haiku.go
+@@ -0,0 +1,184 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package tailssh
++
++import (
++	"fmt"
++	"os"
++	"strings"
++	"syscall"
++	"unsafe"
++
++	gliderssh "github.com/tailscale/gliderssh"
++	"golang.org/x/crypto/ssh"
++	"tailscale.com/types/logger"
++)
++
++// Haiku has no golang.org/x/sys/unix, and creack/pty and u-root's termios do
++// not support it, so the incubator's OS-specific parts are done here with
++// libroot's ioctl, called the way package syscall calls libroot.
++
++//go:cgo_import_dynamic libc___ioctl __ioctl "libroot.so"
++//go:linkname libc___ioctl libc___ioctl
++
++var libc___ioctl uintptr
++
++//go:linkname sysvicall6 syscall.sysvicall6
++func sysvicall6(trap, nargs, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall.Errno)
++
++// ioctl calls __ioctl(fd, op, arg, size). Haiku's ioctl takes the size of
++// the argument as a fourth parameter.
++func ioctl(fd int, op uintptr, arg unsafe.Pointer, size uintptr) error {
++	_, _, e := sysvicall6(uintptr(unsafe.Pointer(&libc___ioctl)), 4, uintptr(fd), op, uintptr(arg), size, 0, 0)
++	if e != 0 {
++		return e
++	}
++	return nil
++}
++
++// From <termios.h> and <tty.h> (private).
++const (
++	haikuTCGETA                = 0x8000
++	haikuTCSETA                = 0x8001
++	haikuTIOCSWINSZ            = 0x800d
++	haikuB_IOCTL_GET_TTY_INDEX = 0x8020
++	haikuB_IOCTL_GRANT_TTY     = 0x8021
++)
++
++// haikuTermios is struct termios.
++type haikuTermios struct {
++	Iflag      uint16
++	Ispeed     uint16
++	Oflag      uint16
++	Ospeed     uint16
++	Cflag      uint16
++	IspeedHigh uint16
++	Lflag      uint16
++	OspeedHigh uint16
++	Line       uint8
++	_          [2]uint8
++	CC         [11]uint8
++}
++
++type haikuWinsize struct {
++	Row, Col, Xpixel, Ypixel uint16
++}
++
++func init() {
++	// The slave of /dev/pt/pN is /dev/tt/pN; SSH_TTY is /dev/ + this.
++	ptyName = func(f *os.File) (string, error) {
++		name, ok := strings.CutPrefix(f.Name(), "/dev/pt/")
++		if !ok {
++			return "", fmt.Errorf("not a pty master: %q", f.Name())
++		}
++		return "tt/" + name, nil
++	}
++}
++
++func execve(argv0 string, argv []string, envv []string) error {
++	return syscall.Exec(argv0, argv, envv)
++}
++
++// openPTY opens a pseudo-terminal pair the way posix_openpt, grantpt and
++// ptsname do in libroot. The master is named /dev/pt/<x>, the device it is,
++// so that ptyName can derive the slave's name from it.
++func openPTY() (ptyFile, tty *os.File, err error) {
++	fd, err := syscall.Open("/dev/ptmx", syscall.O_RDWR|syscall.O_NOCTTY|syscall.O_CLOEXEC, 0)
++	if err != nil {
++		return nil, nil, &os.PathError{Op: "open", Path: "/dev/ptmx", Err: err}
++	}
++	if err := ioctl(fd, haikuB_IOCTL_GRANT_TTY, nil, 0); err != nil {
++		syscall.Close(fd)
++		return nil, nil, fmt.Errorf("grantpt: %w", err)
++	}
++	var index int32
++	if err := ioctl(fd, haikuB_IOCTL_GET_TTY_INDEX, unsafe.Pointer(&index), unsafe.Sizeof(index)); err != nil {
++		syscall.Close(fd)
++		return nil, nil, fmt.Errorf("ptsname: %w", err)
++	}
++	name := fmt.Sprintf("%c%x", 'p'+index/16, index%16)
++	ptyFile = os.NewFile(uintptr(fd), "/dev/pt/"+name)
++	tty, err = os.OpenFile("/dev/tt/"+name, os.O_RDWR|syscall.O_NOCTTY, 0)
++	if err != nil {
++		ptyFile.Close()
++		return nil, nil, err
++	}
++	return ptyFile, tty, nil
++}
++
++func setWinsize(fd int, win gliderssh.Window) {
++	ws := haikuWinsize{
++		Row:    uint16(win.Height),
++		Col:    uint16(win.Width),
++		Xpixel: uint16(win.WidthPixels),
++		Ypixel: uint16(win.HeightPixels),
++	}
++	ioctl(fd, haikuTIOCSWINSZ, unsafe.Pointer(&ws), unsafe.Sizeof(ws))
++}
++
++// The ssh terminal modes Haiku's termios has, by flag word.
++var (
++	haikuCC = map[uint8]int{
++		ssh.VINTR: 0, ssh.VQUIT: 1, ssh.VERASE: 2, ssh.VKILL: 3, ssh.VEOF: 4,
++		ssh.VEOL: 5, ssh.VEOL2: 6, ssh.VSWTCH: 7, ssh.VSTART: 8, ssh.VSTOP: 9,
++		ssh.VSUSP: 10,
++	}
++	haikuIflag = map[uint8]uint16{
++		ssh.IGNPAR: 0x04, ssh.PARMRK: 0x08, ssh.INPCK: 0x10, ssh.ISTRIP: 0x20,
++		ssh.INLCR: 0x40, ssh.IGNCR: 0x80, ssh.ICRNL: 0x100, ssh.IUCLC: 0x200,
++		ssh.IXON: 0x400, ssh.IXANY: 0x800, ssh.IXOFF: 0x1000,
++	}
++	haikuOflag = map[uint8]uint16{
++		ssh.OPOST: 0x01, ssh.OLCUC: 0x02, ssh.ONLCR: 0x04, ssh.OCRNL: 0x08,
++		ssh.ONOCR: 0x10, ssh.ONLRET: 0x20,
++	}
++	haikuCflag = map[uint8]uint16{
++		ssh.CS8: 0x20, ssh.PARENB: 0x100, ssh.PARODD: 0x200,
++	}
++	haikuLflag = map[uint8]uint16{
++		ssh.ISIG: 0x01, ssh.ICANON: 0x02, ssh.XCASE: 0x04, ssh.ECHO: 0x08,
++		ssh.ECHOE: 0x10, ssh.ECHOK: 0x20, ssh.ECHONL: 0x40, ssh.NOFLSH: 0x80,
++		ssh.TOSTOP: 0x100, ssh.IEXTEN: 0x200, ssh.ECHOCTL: 0x400,
++		ssh.ECHOKE: 0x1000, ssh.PENDIN: 0x4000,
++	}
++)
++
++// applyPTYModes applies the window size and terminal modes of ptyReq to the
++// tty open as fd. Modes Haiku's termios lacks, and the line speeds, are
++// ignored.
++func applyPTYModes(fd int, ptyReq *gliderssh.Pty, vlogf logger.Logf) error {
++	var t haikuTermios
++	if err := ioctl(fd, haikuTCGETA, unsafe.Pointer(&t), unsafe.Sizeof(t)); err != nil {
++		return fmt.Errorf("TCGETA: %w", err)
++	}
++	set := func(word *uint16, bit uint16, on bool) {
++		if on {
++			*word |= bit
++		} else {
++			*word &^= bit
++		}
++	}
++	for c, v := range ptyReq.Modes {
++		if i, ok := haikuCC[c]; ok {
++			t.CC[i] = uint8(v)
++		} else if b, ok := haikuIflag[c]; ok {
++			set(&t.Iflag, b, v != 0)
++		} else if b, ok := haikuOflag[c]; ok {
++			set(&t.Oflag, b, v != 0)
++		} else if b, ok := haikuCflag[c]; ok {
++			set(&t.Cflag, b, v != 0)
++		} else if b, ok := haikuLflag[c]; ok {
++			set(&t.Lflag, b, v != 0)
++		} else if c != ssh.TTY_OP_ISPEED && c != ssh.TTY_OP_OSPEED {
++			vlogf("unsupported opcode: %d=%v", c, v)
++		}
++	}
++	if err := ioctl(fd, haikuTCSETA, unsafe.Pointer(&t), unsafe.Sizeof(t)); err != nil {
++		return fmt.Errorf("TCSETA: %w", err)
++	}
++	setWinsize(fd, ptyReq.Window)
++	return nil
++}
+diff --git a/ssh/tailssh/incubator_sys.go b/ssh/tailssh/incubator_sys.go
+new file mode 100644
+index 0000000..f73ca98
+--- /dev/null
++++ b/ssh/tailssh/incubator_sys.go
+@@ -0,0 +1,85 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd
++
++package tailssh
++
++import (
++	"fmt"
++	"os"
++	"syscall"
++
++	"github.com/creack/pty"
++	gliderssh "github.com/tailscale/gliderssh"
++	"github.com/u-root/u-root/pkg/termios"
++	"golang.org/x/crypto/ssh"
++	"golang.org/x/sys/unix"
++	"tailscale.com/types/logger"
++)
++
++// The OS-specific parts of the incubator: exec, PTY allocation and terminal
++// settings. Haiku has its own versions in incubator_haiku.go.
++
++func execve(argv0 string, argv []string, envv []string) error {
++	return unix.Exec(argv0, argv, envv)
++}
++
++func openPTY() (ptyFile, tty *os.File, err error) {
++	return pty.Open()
++}
++
++func setWinsize(fd int, win gliderssh.Window) {
++	unix.IoctlSetWinsize(fd, syscall.TIOCSWINSZ, &unix.Winsize{
++		Row:    uint16(win.Height),
++		Col:    uint16(win.Width),
++		Xpixel: uint16(win.WidthPixels),
++		Ypixel: uint16(win.HeightPixels),
++	})
++}
++
++// applyPTYModes applies the window size and terminal modes of ptyReq to the
++// tty open as fd.
++func applyPTYModes(fd int, ptyReq *gliderssh.Pty, vlogf logger.Logf) error {
++	// Load existing PTY settings to modify them & save them back.
++	tios, err := termios.GTTY(fd)
++	if err != nil {
++		return fmt.Errorf("GTTY: %w", err)
++	}
++
++	// Set the rows & cols to those advertised from the ptyReq frame
++	// received over SSH.
++	tios.Row = int(ptyReq.Window.Height)
++	tios.Col = int(ptyReq.Window.Width)
++
++	for c, v := range ptyReq.Modes {
++		if c == ssh.TTY_OP_ISPEED {
++			tios.Ispeed = int(v)
++			continue
++		}
++		if c == ssh.TTY_OP_OSPEED {
++			tios.Ospeed = int(v)
++			continue
++		}
++		k, ok := opcodeShortName[c]
++		if !ok {
++			vlogf("unknown opcode: %d", c)
++			continue
++		}
++		if _, ok := tios.CC[k]; ok {
++			tios.CC[k] = uint8(v)
++			continue
++		}
++		if _, ok := tios.Opts[k]; ok {
++			tios.Opts[k] = v > 0
++			continue
++		}
++		vlogf("unsupported opcode: %v(%d)=%v", k, c, v)
++	}
++
++	// Save PTY settings.
++	if _, err := tios.STTY(fd); err != nil {
++		return fmt.Errorf("STTY: %w", err)
++	}
++	return nil
++}
+diff --git a/ssh/tailssh/listen.go b/ssh/tailssh/listen.go
+index 8c98127..73349f5 100644
+--- a/ssh/tailssh/listen.go
++++ b/ssh/tailssh/listen.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9 || haiku
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/session.go b/ssh/tailssh/session.go
+index c19ae7b..067ebab 100644
+--- a/ssh/tailssh/session.go
++++ b/ssh/tailssh/session.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9 || haiku
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/tailssh.go b/ssh/tailssh/tailssh.go
+index 9ce3d19..4a220bc 100644
+--- a/ssh/tailssh/tailssh.go
++++ b/ssh/tailssh/tailssh.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9 || haiku
+ 
+ // Package tailssh is an SSH server integrated into Tailscale.
+ package tailssh
+diff --git a/ssh/tailssh/user.go b/ssh/tailssh/user.go
+index 8d7775c..9a6a86f 100644
+--- a/ssh/tailssh/user.go
++++ b/ssh/tailssh/user.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9 || haiku
+ 
+ package tailssh
+ 
+@@ -91,6 +91,10 @@ func defaultPathForUser(u *user.User) string {
+ 	if runtime.GOOS == "plan9" {
+ 		return "/bin"
+ 	}
++	if runtime.GOOS == "haiku" {
++		// What Haiku's SetupEnvironment sets, without ".".
++		return u.HomeDir + "/config/non-packaged/bin:" + u.HomeDir + "/config/bin:/boot/system/non-packaged/bin:/boot/system/bin"
++	}
+ 	isRoot := u.Uid == "0"
+ 	switch distro.Get() {
+ 	case distro.Debian, distro.Crostini:
+diff --git a/util/osuser/user.go b/util/osuser/user.go
+index 3fdbfbb..9590a06 100644
+--- a/util/osuser/user.go
++++ b/util/osuser/user.go
+@@ -10,6 +10,7 @@
+ 	"errors"
+ 	"fmt"
+ 	"log"
++	"os"
+ 	"os/exec"
+ 	"os/user"
+ 	"reflect"
+@@ -106,6 +107,20 @@ func lookup(usernameOrUID string, std lookupStd, wantShell bool) (*user.User, st
+ 		}, "/bin/rc", nil
+ 	}
+ 
++	// Haiku has no getent; os/user reads /etc/passwd without cgo, and the
++	// shell is taken from the same file.
++	if runtime.GOOS == "haiku" {
++		u, err := std(usernameOrUID)
++		if err != nil {
++			return nil, "", err
++		}
++		var shell string
++		if wantShell {
++			shell = passwdShell(u.Username)
++		}
++		return u, shell, nil
++	}
++
+ 	// Start with getent if caller wants to get the user shell.
+ 	if wantShell {
+ 		return userLookupGetent(usernameOrUID, std)
+@@ -235,3 +250,18 @@ func parseGetentUser(out []byte) (*user.User, string, error) {
+ 		HomeDir:  f[5],
+ 	}, f[6], nil
+ }
++
++// passwdShell returns the login shell of username in /etc/passwd, or "".
++func passwdShell(username string) string {
++	b, err := os.ReadFile("/etc/passwd")
++	if err != nil {
++		return ""
++	}
++	for line := range strings.Lines(string(b)) {
++		f := strings.Split(strings.TrimSpace(line), ":")
++		if len(f) >= 7 && f[0] == username {
++			return f[6]
++		}
++	}
++	return ""
++}
+diff --git a/wgengine/magicsock/rebinding_conn.go b/wgengine/magicsock/rebinding_conn.go
+index c361a6b..d5723c0 100644
+--- a/wgengine/magicsock/rebinding_conn.go
++++ b/wgengine/magicsock/rebinding_conn.go
+@@ -20,6 +20,11 @@
+ 	"tailscale.com/types/nettype"
+ )
+ 
++// beforeWriteTo, if non-nil, is called with the destination of every write
++// before it is sent. Haiku uses it to route the destination around the tunnel
++// while an exit node is in use (see netns.PinBypassRoute).
++var beforeWriteTo func(netip.Addr)
++
+ // RebindingUDPConn is a UDP socket that can be re-bound.
+ // Unix has no notion of re-binding a socket, so we swap it out for a new one.
+ type RebindingUDPConn struct {
+@@ -85,6 +90,9 @@ func (c *RebindingUDPConn) WriteWireGuardBatchTo(buffs [][]byte, addr epAddr, of
+ 	if offset != packet.GeneveFixedHeaderLength {
+ 		return fmt.Errorf("RebindingUDPConn.WriteWireGuardBatchTo: [unexpected] offset (%d) != Geneve header length (%d)", offset, packet.GeneveFixedHeaderLength)
+ 	}
++	if beforeWriteTo != nil {
++		beforeWriteTo(addr.ap.Addr())
++	}
+ 	gh := packet.GeneveHeader{
+ 		Protocol: packet.GeneveProtocolWireGuard,
+ 		VNI:      addr.vni,
+@@ -186,6 +194,9 @@ func (c *RebindingUDPConn) writeToUDPAddrPortWithInitPconn(pconn nettype.PacketC
+ }
+ 
+ func (c *RebindingUDPConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
++	if beforeWriteTo != nil {
++		beforeWriteTo(addr.Addr())
++	}
+ 	return c.writeToUDPAddrPortWithInitPconn(*c.pconnAtomic.Load(), b, addr)
+ }
+ 
+diff --git a/wgengine/magicsock/rebinding_conn_haiku.go b/wgengine/magicsock/rebinding_conn_haiku.go
+new file mode 100644
+index 0000000..2febea2
+--- /dev/null
++++ b/wgengine/magicsock/rebinding_conn_haiku.go
+@@ -0,0 +1,12 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build haiku
++
++package magicsock
++
++import "tailscale.com/net/netns"
++
++func init() {
++	beforeWriteTo = netns.PinBypassRoute
++}
+diff --git a/wgengine/netstack/netstack_userping.go b/wgengine/netstack/netstack_userping.go
+index d42c8fb..6a2fe6a 100644
+--- a/wgengine/netstack/netstack_userping.go
++++ b/wgengine/netstack/netstack_userping.go
+@@ -35,7 +35,8 @@ func (ns *Impl) sendOutboundUserPing(dstIP netip.Addr, timeout time.Duration) er
+ 			// For now we just drop it.
+ 			err = errors.New("unsuccessful ICMP reply received")
+ 		}
+-	case "freebsd":
++	case "freebsd", "haiku":
++		// Haiku's ping is FreeBSD's: -W is in milliseconds.
+ 		// Note: 2000 ms is actually 1 second + 2,000
+ 		// milliseconds extra for 3 seconds total.
+ 		// See https://github.com/tailscale/tailscale/pull/3753 for details.
 diff --git a/wgengine/router/osrouter/router_haiku.go b/wgengine/router/osrouter/router_haiku.go
 new file mode 100644
-index 0000000..af7bef6
+index 0000000..7e0af4a
 --- /dev/null
 +++ b/wgengine/router/osrouter/router_haiku.go
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,321 @@
 +// Copyright (c) Tailscale Inc & contributors
 +// SPDX-License-Identifier: BSD-3-Clause
 +
@@ -330,6 +1811,7 @@ index 0000000..af7bef6
 +package osrouter
 +
 +import (
++	"errors"
 +	"fmt"
 +	"net"
 +	"net/netip"
@@ -339,6 +1821,7 @@ index 0000000..af7bef6
 +
 +	"github.com/tailscale/wireguard-go/tun"
 +	"tailscale.com/net/netmon"
++	"tailscale.com/net/netns"
 +	"tailscale.com/net/tsaddr"
 +	"tailscale.com/types/logger"
 +	"tailscale.com/wgengine/router"
@@ -370,14 +1853,21 @@ index 0000000..af7bef6
 +
 +// haikuRouter configures a tun interface with Haiku's ifconfig and route.
 +//
-+// Only IPv4 is set up. Haiku's tunnel device refuses an IPv6 address
-+// ("Invalid Argument"), so the tailnet's IPv6 addresses and routes are left
-+// out; peers are reached by their IPv4 addresses.
++// IPv4 is set up as before. IPv6 is set up on top of it, best effort: a
++// Haiku whose network stack has no IPv6 datalink for tunnel devices refuses
++// the address ("Invalid Argument"). Then the IPv6 address and routes are
++// left out, peers are reached by their IPv4 addresses, and IPv6 errors are
++// logged but never returned, so they cannot fail an IPv4 configuration.
 +type haikuRouter struct {
 +	logf    logger.Logf
 +	tunname string
 +	local   netip.Prefix
 +	routes  map[netip.Prefix]bool
++	bypass  bool // netns.SetupBypass is in effect
++
++	local6  netip.Prefix          // IPv6 address set on the interface
++	routes6 map[netip.Prefix]bool // IPv6 routes set
++	failed6 netip.Addr            // IPv6 address the interface refused
 +}
 +
 +func newHaikuRouter(logf logger.Logf, tundev tun.Device) (router.Router, error) {
@@ -416,7 +1906,8 @@ index 0000000..af7bef6
 +	for _, f := range strings.FieldsFunc(string(out), func(r rune) bool {
 +		return r == ' ' || r == ',' || r == '\n' || r == '\t'
 +	}) {
-+		if a, err := netip.ParseAddr(f); err == nil && tsaddr.CGNATRange().Contains(a) {
++		if a, err := netip.ParseAddr(f); err == nil &&
++			(tsaddr.CGNATRange().Contains(a) || tsaddr.TailscaleULARange().Contains(a)) {
 +			return true
 +		}
 +	}
@@ -427,13 +1918,50 @@ index 0000000..af7bef6
 +	return net.IP(net.CIDRMask(p.Bits(), 32)).String()
 +}
 +
++// haikuRun6 is haikuRun for IPv6 commands: failures are logged as IPv6 ones.
++func haikuRun6(logf logger.Logf, args ...string) error {
++	return haikuRun(func(format string, a ...any) {
++		logf("router: IPv6: "+format, a...)
++	}, args...)
++}
++
 +func (r *haikuRouter) Up() error {
 +	return haikuRun(r.logf, "ifconfig", r.tunname, "up")
 +}
 +
 +func (r *haikuRouter) route(verb string, p netip.Prefix) error {
++	if p.Bits() == 0 {
++		// The default route of an exit node goes in as more specific
++		// routes: they win over the physical default route, which stays
++		// for the host routes that keep tailscaled's own traffic out of
++		// the tunnel. Not 0.0.0.0/1: route(8) takes any route to 0.0.0.0
++		// for a default route and drops the mask, so 0.0.0.0/8 (which is
++		// not routable anyway) is left out.
++		var errs []error
++		for _, h := range haikuDefaultHalves {
++			errs = append(errs, r.route(verb, h))
++		}
++		return errors.Join(errs...)
++	}
 +	return haikuRun(r.logf, "route", verb, r.tunname, "inet",
 +		p.Masked().Addr().String(), "netmask", haikuMask(p))
++}
++
++// haikuDefaultHalves covers 1.0.0.0 to 255.255.255.255.
++var haikuDefaultHalves = []netip.Prefix{
++	netip.MustParsePrefix("1.0.0.0/8"),
++	netip.MustParsePrefix("2.0.0.0/7"),
++	netip.MustParsePrefix("4.0.0.0/6"),
++	netip.MustParsePrefix("8.0.0.0/5"),
++	netip.MustParsePrefix("16.0.0.0/4"),
++	netip.MustParsePrefix("32.0.0.0/3"),
++	netip.MustParsePrefix("64.0.0.0/2"),
++	netip.MustParsePrefix("128.0.0.0/1"),
++}
++
++func (r *haikuRouter) route6(verb string, p netip.Prefix) error {
++	return haikuRun6(r.logf, "route", verb, r.tunname, "inet6",
++		p.Masked().Addr().String(), "prefixlen", fmt.Sprint(p.Bits()))
 +}
 +
 +func (r *haikuRouter) Set(cfg *router.Config) (reterr error) {
@@ -460,6 +1988,7 @@ index 0000000..af7bef6
 +			// A different address: start from an interface without routes.
 +			haikuRun(r.logf, "ifconfig", r.tunname, "down")
 +			r.routes = nil
++			r.routes6 = nil
 +		}
 +		if local.IsValid() {
 +			// The interface's own route covers only this address; every
@@ -476,6 +2005,7 @@ index 0000000..af7bef6
 +			setErr(haikuRun(r.logf, "ifconfig", r.tunname, "down"))
 +			r.local = netip.Prefix{}
 +			r.routes = nil
++			r.routes6 = nil
 +		}
 +	}
 +
@@ -485,6 +2015,16 @@ index 0000000..af7bef6
 +			if p.Addr().Is4() && p.Masked() != local.Masked() {
 +				want[p.Masked()] = true
 +			}
++		}
++	}
++	def := netip.PrefixFrom(netip.IPv4Unspecified(), 0)
++	if want[def] && !r.bypass {
++		// Without the bypass the tunnel's own packets would loop into it.
++		if err := netns.SetupBypass(r.logf, r.tunname); err != nil {
++			setErr(err)
++			delete(want, def)
++		} else {
++			r.bypass = true
 +		}
 +	}
 +	for p := range r.routes {
@@ -501,7 +2041,84 @@ index 0000000..af7bef6
 +		}
 +	}
 +	r.routes = want
++	if r.bypass && !want[def] {
++		netns.CleanupBypass(r.logf)
++		r.bypass = false
++	}
++
++	r.set6(cfg)
 +	return reterr
++}
++
++// set6 sets the IPv6 address and routes. Its errors are only logged.
++func (r *haikuRouter) set6(cfg *router.Config) {
++	var local6 netip.Prefix
++	for _, a := range cfg.LocalAddrs {
++		if a.Addr().Is6() {
++			local6 = a
++			break
++		}
++	}
++
++	if local6 != r.local6 {
++		switch {
++		case local6.IsValid() && local6.Addr() == r.failed6:
++			// Refused before; asking again on every netmap change
++			// would only repeat the error.
++		case local6.IsValid():
++			// Setting an IPv6 address replaces the previous one.
++			err := haikuRun6(r.logf, "ifconfig", r.tunname, "inet6",
++				local6.Addr().String(), "prefixlen", "128", "up")
++			if err == nil {
++				r.local6 = local6
++				r.failed6 = netip.Addr{}
++			} else {
++				r.logf("router: IPv6: the tun interface refused %v; "+
++					"continuing with IPv4 only", local6.Addr())
++				if r.local6.IsValid() {
++					haikuRun6(r.logf, "ifconfig", "--delete", r.tunname,
++						"inet6", r.local6.Addr().String())
++				}
++				r.local6 = netip.Prefix{}
++				r.failed6 = local6.Addr()
++			}
++		default:
++			if r.local6.IsValid() {
++				haikuRun6(r.logf, "ifconfig", "--delete", r.tunname,
++					"inet6", r.local6.Addr().String())
++			}
++			r.local6 = netip.Prefix{}
++		}
++	}
++
++	want := make(map[netip.Prefix]bool)
++	if r.local6.IsValid() {
++		for _, p := range cfg.Routes {
++			if !p.Addr().Is6() || p.Masked() == r.local6.Masked() {
++				continue
++			}
++			if p.Bits() == 0 {
++				// An IPv6 default route (exit node) would also take
++				// tailscaled's own IPv6 traffic into the tunnel:
++				// there is no IPv6 bypass, so it is left out.
++				continue
++			}
++			want[p.Masked()] = true
++		}
++	}
++	for p := range r.routes6 {
++		if !want[p] {
++			r.route6("delete", p)
++		}
++	}
++	for p := range want {
++		if !r.routes6[p] {
++			if err := r.route6("add", p); err != nil {
++				delete(want, p)
++			}
++		}
++	}
++	r.routes6 = want
 +}
 +
 +func (r *haikuRouter) Close() error {

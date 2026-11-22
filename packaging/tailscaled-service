@@ -30,13 +30,13 @@ daemon=$here/tailscaled
 log=$state_dir/tailscaled.log
 [ -f "$log" ] && mv -f "$log" "$log.1"
 
-# In TUN mode the daemon puts its own resolver into the system's resolv.conf.
-# It cannot be stopped politely (it does not react to SIGTERM, see
-# docs/PORTING.md), so whoever stops it kills it, and a killed daemon restores
-# nothing. --cleanup does: it puts resolv.conf back and removes the interface.
-# Run it after the daemon is gone - and before starting, for the case where
-# this script was killed as well. It must not run while another daemon is
-# alive, hence the socket check.
+# In TUN mode the daemon puts its own resolver into the system's resolv.conf
+# and its routes into the routing table. Stopped with SIGTERM or SIGINT it
+# puts both back itself, but a daemon killed with kill -9 (or one that
+# crashed) restores nothing. --cleanup does: it puts resolv.conf back and
+# takes the interface down. Run it after the daemon is gone - and before
+# starting, for the case where this script was killed as well. It must not
+# run while another daemon is alive, hence the socket check.
 cleanup() {
 	"$daemon" --cleanup --tun="$tun" --socket="$state_dir/tailscaled.sock" \
 		--statedir="$state_dir" >>"$log" 2>&1

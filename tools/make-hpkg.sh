@@ -93,7 +93,7 @@ cp "$here"/README*.md "$here/LICENSE" "$stage/documentation/packages/$name/"
 if [ "$arch" = x86_gcc2 ]; then
 	netdesc="tailscaled runs in userspace-networking mode and offers the tailnet to applications through a SOCKS5 proxy (127.0.0.1:1055) and an HTTP proxy (127.0.0.1:1056)"
 else
-	netdesc="tailscaled uses a TUN interface, so every application reaches the tailnet directly (IPv4) and MagicDNS names resolve system-wide; without the tunnel driver it falls back to userspace networking. A SOCKS5 proxy (127.0.0.1:1055) and an HTTP proxy (127.0.0.1:1056) are offered either way"
+	netdesc="tailscaled uses a TUN interface, so every application reaches the tailnet directly (IPv4) and MagicDNS names resolve system-wide; without the tunnel driver it falls back to userspace networking. A SOCKS5 proxy (127.0.0.1:1055) and an HTTP proxy (127.0.0.1:1056) are offered either way. It also includes the Tailscale SSH server, subnet routes and exit nodes"
 fi
 
 cat > "$stage/.PackageInfo" <<INFO

@@ -1,0 +1,22 @@
+diff -ruN sftp.orig/attrs_unix.go sftp/attrs_unix.go
+--- a/attrs_unix.go	2026-11-22 10:34:05.866998125 +0000
++++ b/attrs_unix.go	2026-11-22 10:34:07.260931000 +0000
+@@ -1,5 +1,5 @@
+-//go:build darwin || dragonfly || freebsd || (!android && linux) || netbsd || openbsd || solaris || aix || js
+-// +build darwin dragonfly freebsd !android,linux netbsd openbsd solaris aix js
++//go:build darwin || dragonfly || freebsd || (!android && linux) || netbsd || openbsd || solaris || aix || js || haiku
++// +build darwin dragonfly freebsd !android,linux netbsd openbsd solaris aix js haiku
+ 
+ package sftp
+ 
+diff -ruN sftp.orig/ls_unix.go sftp/ls_unix.go
+--- a/ls_unix.go	2026-11-22 10:34:06.653020875 +0000
++++ b/ls_unix.go	2026-11-22 10:34:07.296931000 +0000
+@@ -1,5 +1,5 @@
+-//go:build aix || darwin || dragonfly || freebsd || (!android && linux) || netbsd || openbsd || solaris || js
+-// +build aix darwin dragonfly freebsd !android,linux netbsd openbsd solaris js
++//go:build aix || darwin || dragonfly || freebsd || (!android && linux) || netbsd || openbsd || solaris || js || haiku
++// +build aix darwin dragonfly freebsd !android,linux netbsd openbsd solaris js haiku
+ 
+ package sftp
+ 

@@ -1,0 +1,120 @@
+network: let tunnel (TUN) interfaces carry IPv6
+
+The stack registered the loopback_frame datalink only for AF_INET on
+IFT_TUNNEL, so there was no AF_INET6 datalink chain for a TUN device:
+get_domain_datalink_protocols() failed with EAFNOSUPPORT, get_interface()
+returned NULL and datalink_control() answered B_BAD_VALUE, which ifconfig
+shows as "Setting address failed: Invalid Argument".
+
+- stack.cpp: register loopback_frame for AF_INET6/IFT_TUNNEL too.
+- loopback_frame.cpp: register the device handler for the frame type of
+  the domain (IPv4 or IPv6) instead of always IPv4, remember it, and
+  unregister that type on uninit (it passed 0, which matched no handler,
+  so the IPv4 handler was never removed), and do not leak the deframer
+  when registering the handler fails.
+
+The tunnel driver already tags written IPv6 packets with
+B_NET_FRAME_TYPE_IPV6 and accepts AF_INET6 buffers on send.
+
+diff --git a/src/add-ons/kernel/network/datalink_protocols/loopback_frame/loopback_frame.cpp b/src/add-ons/kernel/network/datalink_protocols/loopback_frame/loopback_frame.cpp
+index edbd89add5..c48dec5afd 100644
+--- a/src/add-ons/kernel/network/datalink_protocols/loopback_frame/loopback_frame.cpp
++++ b/src/add-ons/kernel/network/datalink_protocols/loopback_frame/loopback_frame.cpp
+@@ -25,6 +25,8 @@
+ 
+ 
+ struct loopback_frame_protocol : net_datalink_protocol {
++	int32	frame_type;
++		// device handler type registered for IFT_TUNNEL, or 0
+ };
+ 
+ 
+@@ -50,6 +52,7 @@ loopback_frame_init(struct net_interface*interface, net_domain* domain,
+ 		return B_BAD_TYPE;
+ 
+ 	loopback_frame_protocol* protocol;
++	int32 frameType = 0;
+ 
+ 	net_stack_module_info* stack;
+ 	status_t status = get_module(NET_STACK_MODULE_NAME, (module_info**)&stack);
+@@ -64,23 +67,41 @@ loopback_frame_init(struct net_interface*interface, net_domain* domain,
+ 		// Locally received buffers don't need a domain device handler, as the
+ 		// buffer reception is handled internally.
+ 	} else if (interface->device->type == IFT_TUNNEL) {
++		// TUN devices carry raw IP packets: route them to the domain
++		// matching the packet's IP version.
++		switch (domain->family) {
++			case AF_INET:
++				frameType = B_NET_FRAME_TYPE_IPV4;
++				break;
++			case AF_INET6:
++				frameType = B_NET_FRAME_TYPE_IPV6;
++				break;
++			default:
++				status = B_BAD_TYPE;
++				goto err2;
++		}
++
+ 		status = stack->register_domain_device_handler(
+-			interface->device, B_NET_FRAME_TYPE_IPV4, domain);
++			interface->device, frameType, domain);
+ 		if (status != B_OK)
+-			return status;
++			goto err2;
+ 	}
+ 
+ 	protocol = new(std::nothrow) loopback_frame_protocol;
+ 	if (protocol == NULL) {
+ 		status = B_NO_MEMORY;
+-		goto err2;
++		goto err3;
+ 	}
++	protocol->frame_type = frameType;
+ 
+ 	put_module(NET_STACK_MODULE_NAME);
+ 
+ 	*_protocol = protocol;
+ 	return B_OK;
+ 
++err3:
++	if (frameType != 0)
++		stack->unregister_device_handler(interface->device, frameType);
+ err2:
+ 	stack->unregister_device_deframer(interface->device);
+ err1:
+@@ -92,14 +113,20 @@ err1:
+ status_t
+ loopback_frame_uninit(net_datalink_protocol* protocol)
+ {
++	loopback_frame_protocol* loopbackProtocol
++		= (loopback_frame_protocol*)protocol;
++
+ 	net_stack_module_info* stack;
+ 	if (get_module(NET_STACK_MODULE_NAME, (module_info**)&stack) == B_OK) {
+ 		stack->unregister_device_deframer(protocol->interface->device);
+-		stack->unregister_device_handler(protocol->interface->device, 0);
++		if (loopbackProtocol->frame_type != 0) {
++			stack->unregister_device_handler(protocol->interface->device,
++				loopbackProtocol->frame_type);
++		}
+ 		put_module(NET_STACK_MODULE_NAME);
+ 	}
+ 
+-	delete protocol;
++	delete loopbackProtocol;
+ 	return B_OK;
+ }
+ 
+diff --git a/src/add-ons/kernel/network/stack/stack.cpp b/src/add-ons/kernel/network/stack/stack.cpp
+index 292099c68e..d28ee1029a 100644
+--- a/src/add-ons/kernel/network/stack/stack.cpp
++++ b/src/add-ons/kernel/network/stack/stack.cpp
+@@ -850,6 +850,8 @@ init_stack()
+ #endif
+ 	register_domain_datalink_protocols(AF_INET6, IFT_LOOP,
+ 		"network/datalink_protocols/loopback_frame/v1", NULL);
++	register_domain_datalink_protocols(AF_INET6, IFT_TUNNEL,
++		"network/datalink_protocols/loopback_frame/v1", NULL);
+ 	register_domain_datalink_protocols(AF_INET, IFT_ETHER,
+ 		"network/datalink_protocols/arp/v1",
+ 		"network/datalink_protocols/ethernet_frame/v1",

@@ -82,9 +82,10 @@ fi
 # --- patched dependencies ----------------------------------------------------
 
 # wireguard-go needs build tags and the Haiku TUN device, gvisor a small
-# change. They are copied out of the module cache and pulled in with a
-# replace directive: the cache itself stays pristine, and the go command
-# cannot serve a stale index for a directory it assumes never changes.
+# change, pkg/sftp (for Tailscale SSH) build tags. They are copied out of the
+# module cache and pulled in with a replace directive: the cache itself stays
+# pristine, and the go command cannot serve a stale index for a directory it
+# assumes never changes.
 patched_copy() {
 	module=$1
 	name=$2
@@ -105,15 +106,18 @@ patched_copy() {
 
 patched_copy github.com/tailscale/wireguard-go wireguard-go "$here/deps/wireguard-go-haiku.patch"
 patched_copy gvisor.dev/gvisor gvisor "$here/deps/gvisor-haiku-entropy.patch"
+patched_copy github.com/pkg/sftp sftp "$here/deps/sftp-haiku.patch"
 
 # --- build -------------------------------------------------------------------
 
 # The minimal feature sets the 32-bit port ships, plus, for the daemon, what
 # a TUN interface needs: osrouter (addresses and routes) and dns (MagicDNS
-# through the system resolver). featuretags is a host program, so it runs for
-# the build machine, not for Haiku.
-daemon_tags=$(cd "$src" && "$go" run ./cmd/featuretags --min --add=netstack,outboundproxy,ipnbus,osrouter,dns)
-cli_tags=$(cd "$src" && "$go" run ./cmd/featuretags --min --add=cli,ipnbus)
+# through the system resolver); ssh (the Tailscale SSH server); and, for both,
+# subnet routes and exit nodes, advertised and used. featuretags is a host
+# program, so it runs for the build machine, not for Haiku.
+routing=advertiseroutes,advertiseexitnode,useroutes,useexitnode
+daemon_tags=$(cd "$src" && "$go" run ./cmd/featuretags --min --add=netstack,outboundproxy,ipnbus,osrouter,dns,ssh,$routing)
+cli_tags=$(cd "$src" && "$go" run ./cmd/featuretags --min --add=cli,ipnbus,$routing)
 
 # Without these the binaries report "<version>-dev<date>-t<commit>-dirty".
 commit=$(git -C "$src" rev-parse HEAD)

@@ -14,12 +14,13 @@ usarli. Non affiliato a Tailscale Inc.
 
 | Sistema | Comandi |
 | --- | --- |
-| arm64 | `pkgman add-repo http://pkgman.rainygirl.com/arm64`<br>`pkgman install renkuos_rtailscale` |
+| arm64 | `pkgman add-repo https://pkgman.rainygirl.com/arm64`<br>`pkgman install renkuos_rtailscale` |
 | x86_64 | `pkgman add-repo https://pkgman.rainygirl.com/x86_64`<br>`pkgman install renkuos_rtailscale` |
 | x86 a 32 bit (x86_gcc2) | `pkgman add-repo https://pkgman.rainygirl.com/x86_gcc2`<br>`pkgman install renkuos_rtailscale_x86` |
 
 Se `pkgman add-repo` fallisce con `Operation not supported`, il network kit di
-quell'immagine non ha TLS: nell'indirizzo usa `http://` al posto di `https://`.
+quel sistema è stato compilato senza TLS (le immagini RenkuOS arm64 lo hanno);
+usa `http://` invece di `https://` nell'indirizzo.
 
 Il pacchetto installa `tailscale`, `tailscaled`, R Tailscale (in Deskbar ->
 Applications) e un job di launch che avvia il servizio all'accesso. Subito
@@ -27,10 +28,17 @@ dopo l'installazione, prima dell'accesso successivo, è R Tailscale ad avviare
 il servizio.
 
 Su arm64 e x86_64 il servizio usa un'interfaccia TUN: ogni programma raggiunge
-la tailnet direttamente (IPv4) e i nomi MagicDNS vengono risolti in tutto il
+la tailnet direttamente e i nomi MagicDNS vengono risolti in tutto il
 sistema; per questo il `resolv.conf` di sistema viene sostituito mentre il
-servizio è in esecuzione. I dettagli e il comportamento alternativo sono in
-[docs/PORTING.md](docs/PORTING.md#using-it).
+servizio è in esecuzione. La tailnet si raggiunge in IPv4; IPv6 richiede uno
+stack di rete di Haiku con una correzione non ancora presente nelle immagini
+pubblicate. Il servizio segue da solo i cambiamenti di rete (un collegamento
+via cavo o Wi-Fi che cade e ritorna). I dettagli e il comportamento
+alternativo sono in [docs/PORTING.md](docs/PORTING.md#using-it).
+
+Lì si trovano anche il server Tailscale SSH (`tailscale up --ssh`), come
+annunciare subnet route e offrire questa macchina come exit node, e come usare
+un altro dispositivo come exit node (`tailscale set --exit-node=<nome>`).
 
 ## Accesso
 

@@ -22,7 +22,8 @@ what was changed and why.
 build.sh                 build tailscale + tailscaled for arm64 or x86_64
 install.sh               install dist/<arch>/ into ~/config/non-packaged
 patches/                 the 64-bit change to the tailscale source
-deps/                    changes to two dependencies (wireguard-go, gvisor)
+patches/haiku/           a Haiku network stack fix for IPv6 on TUN (not shipped)
+deps/                    changes to three dependencies (wireguard-go, gvisor, pkg/sftp)
 packaging/               tailscaled-service (how the daemon is run), launch job
 tools/make-hpkg.sh       make the installable package, on RenkuOS
 gui/                     R Tailscale, the native window
@@ -37,20 +38,24 @@ startup. Its tailscale patch is about 2,700 lines, most of it avoiding those
 faults, and its launcher restarts the daemon until a start succeeds.
 
 The 64-bit Go ports do not have those faults, so none of that is carried
-over. The 64-bit patch is about 350 lines in 15 files, half of them the
-router for the TUN interface, and only does what Haiku itself requires:
+over. The 64-bit patch adds about 1,400 lines in 38 files and only does
+what Haiku itself requires:
 
 | change | why |
 | --- | --- |
-| `wgengine/router/osrouter`: a router for Haiku | sets the tun interface's address and the tailnet routes with `ifconfig` and `route` |
+| `wgengine/router/osrouter`: a router for Haiku | sets the tun interface's addresses (IPv4, and IPv6 where the stack allows it) and the tailnet routes with `ifconfig` and `route`; an exit node's default route goes in as eight routes from `1.0.0.0/8` to `128.0.0.0/1` |
 | `net/dns`: write the system's `resolv.conf` | Haiku's resolver reads `/boot/system/settings/network/resolv.conf`, not `/etc/resolv.conf` |
 | `cmd/tailscaled`: default to `userspace-networking` | the tunnel driver is not in every image; the service asks for `tun` first and falls back |
 | `paths`: socket and state under `~/config/settings/tailscale` | Haiku has no `/var/run` or `/var/lib` convention |
 | `paths`, `cmd/tailscale/cli`: stop calling `golang.org/x/sys/unix` | that module has no Haiku support |
 | `ipn/ipnserver`: accept LocalAPI clients without peer credentials | Haiku does not expose them; the socket is mode 0600 in the owner's settings directory |
-| `net/netmon`: find the local address by a route lookup | Go's `net.Interfaces()` returns nothing on Haiku, and with no interfaces netcheck skips every STUN probe, leaving the node relay-only |
+| `net/netmon`: read the interfaces and the default route with ioctls, and watch for changes | Go's `net.Interfaces()` returns nothing on Haiku, and with no interfaces netcheck skips every STUN probe, leaving the node relay-only. Changes come from the network stack's notifications (see [Network changes](#network-changes)) |
+| `net/dns`: watch `resolv.conf` | net_server rewrites it on every DHCP lease; the daemon notices within two seconds and puts its resolver back |
+| `ssh/tailssh`, `util/osuser`, `feature/ssh`: the Tailscale SSH server on Haiku | PTYs, terminal modes and window size through libroot's `ioctl`, users and shells from `/etc/passwd`, no `login` or `su` |
+| `cmd/tailscaled`: subnets and exit node traffic in netstack | Haiku's IPv4 stack neither forwards packets nor translates addresses |
+| `net/netns`, `wgengine/magicsock`: keep the daemon's own traffic out of the tunnel | needed while an exit node holds the default route; Haiku has no policy routing or socket marks |
 
-`deps/` holds two more:
+`deps/` holds three more:
 
 - **wireguard-go**: four build tags, so its stub implementations are used,
   and `tun/tun_haiku.go`, the TUN device. Haiku's tunnel driver has no clone
@@ -60,6 +65,18 @@ router for the TUN interface, and only does what Haiku itself requires:
   from `crypto/rand`, and Haiku's `getentropy` can be very slow to produce
   8 KiB: on RenkuOS/arm64 this one initialization held startup for 36 to 45
   seconds. With the change the backend is ready in 2 seconds or less.
+- **pkg/sftp**: two build tags, for the SFTP subsystem of Tailscale SSH.
+
+Some of these need functions Go's `syscall` package for Haiku does not
+offer (`ioctl`, ports, the generic syscall the network notifications use).
+They are plain functions in `libroot.so`, which every Go binary on Haiku
+links against, so they are called the way `golang.org/x/sys/unix` calls
+libc on Solaris: a `//go:cgo_import_dynamic` declaration and
+`syscall.sysvicall6`, without cgo. `net/netmon` and `ssh/tailssh` each
+declare `__ioctl`; the linker merges the two into one import.
+
+`patches/haiku/haiku-tun-ipv6.patch` is not part of the build: it is a
+change to Haiku itself, see [IPv6](#ipv6).
 
 ## Install
 
@@ -72,7 +89,7 @@ Without a package, from a checkout that has `dist/<arch>/` built:
 Or with a package built by `tools/make-hpkg.sh`:
 
 ```sh
-pkgman install ./renkuos_rtailscale-1.102.0-4-arm64.hpkg
+pkgman install ./renkuos_rtailscale-1.102.0-5-arm64.hpkg
 ```
 
 The package installs `tailscale`, `tailscaled`, `tailscaled-service`,
@@ -99,15 +116,16 @@ ssh user@mac-mini
 
 Three things to know about this mode:
 
-- **IPv4 only.** The tunnel driver refuses an IPv6 address, so the tailnet's
-  `fd7a:...` addresses are not configured.
+- **IPv4, and IPv6 only with a fixed network stack.** See [IPv6](#ipv6).
 - **`resolv.conf` is replaced** while the service runs, with the original
   kept beside it as `resolv.pre-tailscale-backup.conf`; `tailscale set
-  --accept-dns=false` leaves it alone. `tailscaled-service` puts the file
-  back when the daemon ends, however it ends, and again before the next
-  start. net_server rewrites the file when it reconfigures an interface
-  (a DHCP renewal, for one), which drops the tailnet's resolver until
-  tailscaled next applies its settings.
+  --accept-dns=false` leaves it alone. The daemon puts the file back when it
+  stops on SIGTERM or SIGINT, and `tailscaled-service` runs `tailscaled
+  --cleanup` after the daemon ends and before the next start, which covers
+  a daemon killed with `kill -9`.
+  net_server rewrites the file when it reconfigures an interface (a DHCP
+  renewal, for one); the daemon watches the file and writes its own
+  version back within about two seconds.
 - **The interface is taken down, not removed,** when the service stops, and
   reused by the next start. Removing it right after closing the device can
   leave the name unusable for a while.
@@ -134,6 +152,101 @@ ssh -o ProxyCommand='tailscale nc %h %p' user@100.x.y.z
 
 R Tailscale's **SSH** button runs exactly that in a Terminal window for the
 selected device.
+
+### Network changes
+
+The daemon reads the interfaces, their addresses and flags, and the default
+route from the kernel with the ioctls Haiku's own `ifconfig` and `route`
+use. It subscribes to the network stack's notifications (the port
+interface that `start_watching_network()` wraps) for interfaces that come,
+go or change and for links that go up or down, and checks the routing table
+every five seconds as well, because route changes have no notification. An
+interface whose device has lost its link counts as down. So pulling a cable
+or losing Wi-Fi pauses the node ("all links down"), and when the link is
+back it rebinds its sockets, finds its public address again and
+reconnects, without a restart.
+
+### IPv6
+
+The router gives the tun interface the node's IPv6 address (`fd7a:...`)
+and the IPv6 routes of the tailnet next to the IPv4 ones. The Haiku network
+stack of released images refuses that address on a tunnel interface
+(`ifconfig: Setting address failed: Invalid Argument`): it registers no IPv6
+datalink protocol for tunnel devices. The daemon then logs that once and
+goes on with IPv4 only, which works as before.
+
+`patches/haiku/haiku-tun-ipv6.patch` is the fix, to Haiku's network stack
+(`stack` and the `loopback_frame` datalink protocol), not to tailscale; with
+it the interface takes the IPv6 address and the tailnet is reachable over
+IPv6 too. It is not part of this package, since it means replacing kernel
+add-ons; see the patch's description. An IPv6 default route (an exit node's
+`::/0`) is never installed, so with an exit node IPv6 traffic to the
+internet does not go through it.
+
+### Tailscale SSH
+
+The daemon can serve SSH to the tailnet itself, with the tailnet's identity
+and access rules instead of keys and passwords:
+
+```sh
+tailscale up --ssh            # or: tailscale set --ssh
+ssh user@this-machine         # from another device in the tailnet
+```
+
+The tailnet policy's `ssh` rules decide who may log in as which user, and
+`check` rules ask for a fresh sign-in in the browser first, as everywhere.
+The user names are this machine's: Haiku has one account (`user` on Haiku,
+`baron` on RenkuOS), found in `/etc/passwd` with its home and shell. Allow
+that name in the policy's `ssh` rule (`"users": ["baron"]`).
+
+What differs from Linux:
+
+- No `login`, `su` or PAM: the shell from `/etc/passwd` is started directly
+  in the user's home, with `PATH` set the way Haiku's Terminal sets it.
+- Every Haiku user has UID 0, so a session has full rights over the
+  machine, as a local Terminal does.
+- Interactive sessions get a pseudo-terminal with the client's terminal
+  modes and window size. The SFTP subsystem is built in.
+
+### Subnet router and exit node
+
+The machine can offer routes to its LAN, or all of the internet, to the
+tailnet, and can send its own internet traffic through another device:
+
+```sh
+tailscale set --advertise-routes=192.168.1.0/24   # then approve in the admin console
+tailscale set --advertise-exit-node               # likewise
+tailscale set --exit-node=<device>                # use another device; no approval needed
+tailscale set --exit-node=                        # stop using it
+```
+
+**Offering routes or an exit node** works through netstack, as on FreeBSD
+and Windows: packets from the tailnet to the advertised networks end in the
+daemon's own TCP/IP stack, which opens ordinary sockets to the real
+destination. Haiku's IPv4 stack neither forwards packets nor translates
+addresses, so the kernel's route table is not used for this. TCP and UDP
+are carried; ping is answered by running Haiku's `ping`.
+
+**Using an exit node** changes the system's routes. The default route is
+not replaced: eight routes from `1.0.0.0/8` to `128.0.0.0/1` through
+`tun/0` cover the internet and win over it, and the physical default route
+stays (`0.0.0.0/8` is left out, as `route` takes any route to `0.0.0.0` for
+the default route). The LAN stays reachable, its on-link route being more
+specific. So that the daemon's own traffic (control server, DERP, STUN, and
+WireGuard to the exit node and the other peers) does not loop into the
+tunnel, each remote address it talks to gets a host route through the
+physical gateway before its first packet. Turning the exit node off, or
+stopping the daemon with SIGTERM, removes all of these routes again.
+
+Limits:
+
+- IPv4 only: no IPv6 default route (see above).
+- After `kill -9` of the daemon, the `tun/0` routes go with the interface
+  (`--cleanup` takes it down), but the host routes through the physical
+  gateway stay until the next restart or `route delete`. They point where
+  the default route points anyway, so they do no harm, but they go stale if
+  the network changes. The same if the network's gateway changes while the
+  exit node is in use: restart the service.
 
 The CLI needs no `--socket` option; the port's default path is the one the
 service uses:
@@ -267,35 +380,76 @@ file over revision 2 and then from pkgman.rainygirl.com; `tailscale version`
 prints only the version, the service opens `tun/0`, a peer answers `ping` and
 its sshd banner by MagicDNS name, and the Mac mini pings back.
 
+Revision 5 on arm64 (RenkuOS live image, hrev60072, Go toolchain with the
+signal fix) and revision 4 on x86_64 (Haiku nightly hrev60450), both under
+QEMU, installed from the file with `pkgman install`, service started with
+`tailscaled-service`, signed in, TUN mode:
+
+- both: `tun/0` up with the node's IPv4 address; `ping mac-mini` and `curl`
+  to an HTTP server on that peer by MagicDNS name; `kill -TERM` of
+  `tailscaled` stops it, the service script ends, `tun/0` is down, the
+  tailnet routes are gone and `resolv.conf` is the DHCP one again;
+  started again, the node is back and the peer answers
+- both: the IPv6 address is refused by the stock stack, logged once, and
+  IPv4 works as before
+- arm64: the virtual NIC's link switched off and on with QEMU's `set_link`:
+  the daemon logs "all links down; pausing", and 20 s after the link is back
+  "LinkChange: major, rebinding"; the peer is reached again directly
+- arm64: `tailscale up --ssh` is accepted and the host keys are published.
+  From a Mac in the tailnet (OpenSSH), after the policy's check was
+  approved in the browser: a command runs as `baron` (UID 0, shell
+  `/bin/bash`) and its exit status comes back; stdin piped into a remote
+  command arrives; an interactive session gets `/dev/tt/p0` with the
+  client's window size, follows a resize (SIGWINCH), Ctrl-C interrupts
+  `cat`, and `exit 4` comes back as 4; `scp` (SFTP and the legacy `-O`
+  protocol) and `sftp` copy a 300 KB file both ways with matching checksums
+- arm64: `tailscale set --exit-node=tokyo`: the eight routes through
+  `tun/0` and host routes for the daemon's peers, DERP and control servers
+  through the physical gateway appear, the public address seen from the
+  internet becomes the exit node's, the tailnet peer is still reached;
+  `--exit-node=` removes the routes, and the routing table and
+  `resolv.conf` are byte-for-byte as before. With the exit node on, a
+  `kill -9` of the daemon: the service's cleanup takes `tun/0` and its
+  routes away and restores `resolv.conf`; four host routes through the
+  gateway stayed, as described under the limits. Started again, the exit
+  node was in use again (the preference is kept)
+- x86_64: after a restart of the machine with the package in `/system`,
+  the launch job started the service (`launch_roster info` shows it
+  running) and the node was back in the tailnet; it stayed up and reached
+  the peer for the six minutes it was watched
+- x86_64, open: once, about ten minutes after the package was reinstalled
+  and the service started by hand from an ssh session, the daemon was found
+  gone; its log was lost (the machine was powered off) and it was not seen
+  again
+
 Not verified:
 
 - **in TUN mode**: a DHCP renewal while connected, a machine that sleeps
-  and wakes, accepting subnet routes, and anything on IPv6
+  and wakes, accepting subnet routes; network changes and exit nodes on
+  x86_64
+- **IPv6** over the tailnet: needs the Haiku stack fix, which is not part of
+  these tests
+- **advertising** subnet routes or an exit node with these packages (it
+  needs admin approval)
 
 - **on x86_64**: R Tailscale's SSH and Copy IP buttons, and inbound
   connections
 - **on 32-bit**: anything past the sign-in link with this package (the
   i386 port itself was developed on a signed-in machine; see `i386/`)
-- **the launch job of a package in `/system`**: seen working for a package
-  in `~/config/packages`; after `pkgman install` the machines were not
-  restarted
-- Tailscale SSH server, serve/funnel, exit nodes, and subnet routes: the
-  minimal build omits them
+- **the launch job of a package in `/system` on arm64**: seen working on
+  x86_64 and for a package in `~/config/packages`
+- serve/funnel, Taildrop and the other features the minimal build omits
 
 ## Known limits
 
-- The interface monitor reports one synthetic interface per address family
-  with a host-length prefix. It notices the network coming and going, but
-  knows nothing about interface names or the LAN's prefix.
 - A `tailscale` command whose output is piped into a program that exits
   early (`tailscale netcheck | head`) has been seen to hang instead of
   dying from SIGPIPE. Redirect to a file, or let it finish.
-- **The daemon does not stop on SIGTERM or SIGINT.** This is the Go runtime,
-  not tailscale: a minimal Go program built with the same haiku/arm64
-  toolchain ignores both signals too, with or without `signal.Notify`. Stop
-  the service with `kill -9 <team>`; the state file is written as it
-  changes, and the next start replaces the stale socket. On x86_64 the
-  daemon does stop on SIGTERM.
+- A daemon killed with `kill -9` cannot clean up: `tailscaled-service`
+  then restores `resolv.conf` and takes the interface down, but host routes
+  added for an exit node stay (see [Subnet router and exit
+  node](#subnet-router-and-exit-node)). Stop it with `kill <team>`
+  (SIGTERM) instead.
 - R Tailscale opens the sign-in link in the default browser. On the arm64
   test image WebPositive crashed while starting (inside WebKit's time zone
   setup, before loading anything). The link stays in the window with a

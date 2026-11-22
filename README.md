@@ -14,12 +14,13 @@ affiliated with Tailscale Inc.
 
 | System | Commands |
 | --- | --- |
-| arm64 | `pkgman add-repo http://pkgman.rainygirl.com/arm64`<br>`pkgman install renkuos_rtailscale` |
+| arm64 | `pkgman add-repo https://pkgman.rainygirl.com/arm64`<br>`pkgman install renkuos_rtailscale` |
 | x86_64 | `pkgman add-repo https://pkgman.rainygirl.com/x86_64`<br>`pkgman install renkuos_rtailscale` |
 | 32-bit x86 (x86_gcc2) | `pkgman add-repo https://pkgman.rainygirl.com/x86_gcc2`<br>`pkgman install renkuos_rtailscale_x86` |
 
-If `pkgman add-repo` fails with `Operation not supported`, the network kit of
-that image has no TLS; use `http://` instead of `https://` in the address.
+If `pkgman add-repo` fails with `Operation not supported`, that system's
+network kit was built without TLS (RenkuOS arm64 images have it); use
+`http://` instead of `https://` in the address.
 
 The package installs `tailscale`, `tailscaled`, R Tailscale (in Deskbar ->
 Applications), and a launch job that starts the service at login. Right
@@ -27,9 +28,16 @@ after installing, before the next login, R Tailscale starts the service
 itself.
 
 On arm64 and x86_64 the service uses a TUN interface: every program reaches
-the tailnet directly (IPv4), and MagicDNS names resolve system-wide, for which
-the system's `resolv.conf` is replaced while the service runs. Details and
-the fallback are in [docs/PORTING.md](docs/PORTING.md#using-it).
+the tailnet directly, and MagicDNS names resolve system-wide, for which the
+system's `resolv.conf` is replaced while the service runs. The tailnet is
+reached over IPv4; IPv6 needs a Haiku network stack with a fix that is not
+in released images yet. The service follows network changes (a cable or
+Wi-Fi link going away and coming back) by itself. Details and the fallback
+are in [docs/PORTING.md](docs/PORTING.md#using-it).
+
+There too: the Tailscale SSH server (`tailscale up --ssh`), advertising
+subnet routes and offering this machine as an exit node, and using another
+device as an exit node (`tailscale set --exit-node=<name>`).
 
 ## Sign in
 

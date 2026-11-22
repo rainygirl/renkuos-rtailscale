@@ -14,23 +14,30 @@ Tailscale を RenkuOS(Haiku)に移植した非公式ポートです。`tailscale
 
 | システム | コマンド |
 | --- | --- |
-| arm64 | `pkgman add-repo http://pkgman.rainygirl.com/arm64`<br>`pkgman install renkuos_rtailscale` |
+| arm64 | `pkgman add-repo https://pkgman.rainygirl.com/arm64`<br>`pkgman install renkuos_rtailscale` |
 | x86_64 | `pkgman add-repo https://pkgman.rainygirl.com/x86_64`<br>`pkgman install renkuos_rtailscale` |
 | 32 ビット x86 (x86_gcc2) | `pkgman add-repo https://pkgman.rainygirl.com/x86_gcc2`<br>`pkgman install renkuos_rtailscale_x86` |
 
-`pkgman add-repo` が `Operation not supported` で失敗する場合、そのイメージの
-ネットワークキットに TLS がありません。アドレスの `https://` を `http://` に
-置き換えてください。
+`pkgman add-repo` が `Operation not supported` で失敗する場合、そのシステムの
+ネットワークキットは TLS なしでビルドされています(RenkuOS arm64 イメージには
+あります)。アドレスの `https://` を `http://` に置き換えてください。
 
 パッケージは `tailscale`、`tailscaled`、R Tailscale(Deskbar -> Applications)、
 ログイン時にサービスを起動する launch ジョブをインストールします。
 インストール直後、次のログインまでは R Tailscale がサービスを起動します。
 
 arm64 と x86_64 では、サービスは TUN インターフェースを使います。すべての
-プログラムが tailnet に直接接続でき(IPv4)、MagicDNS の名前がシステム全体で
+プログラムが tailnet に直接接続でき、MagicDNS の名前がシステム全体で
 解決されます。そのため、サービスの実行中はシステムの `resolv.conf` が
-置き換えられます。詳細と代替動作は
+置き換えられます。tailnet には IPv4 で接続します。IPv6 には、まだ公開済みの
+イメージに入っていない修正を加えた Haiku のネットワークスタックが必要です。
+ネットワークの変化(ケーブルや Wi-Fi のリンクが切れて戻るなど)には
+サービスが自動で追従します。詳細と代替動作は
 [docs/PORTING.md](docs/PORTING.md#using-it) にあります。
+
+同じ文書に、Tailscale SSH サーバー(`tailscale up --ssh`)、サブネットルートの
+広告とこのマシンを exit node として提供する方法、他のデバイスを exit node
+として使う方法(`tailscale set --exit-node=<名前>`)もあります。
 
 ## サインイン
 

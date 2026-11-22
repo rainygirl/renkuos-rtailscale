@@ -14,21 +14,29 @@ Tailscale을 RenkuOS(Haiku)로 옮긴 비공식 포트입니다. `tailscaled` �
 
 | 시스템 | 명령 |
 | --- | --- |
-| arm64 | `pkgman add-repo http://pkgman.rainygirl.com/arm64`<br>`pkgman install renkuos_rtailscale` |
+| arm64 | `pkgman add-repo https://pkgman.rainygirl.com/arm64`<br>`pkgman install renkuos_rtailscale` |
 | x86_64 | `pkgman add-repo https://pkgman.rainygirl.com/x86_64`<br>`pkgman install renkuos_rtailscale` |
 | 32비트 x86 (x86_gcc2) | `pkgman add-repo https://pkgman.rainygirl.com/x86_gcc2`<br>`pkgman install renkuos_rtailscale_x86` |
 
-`pkgman add-repo`가 `Operation not supported`로 실패하면 그 이미지의 네트워크
-키트에 TLS가 없는 것입니다. 주소의 `https://`를 `http://`로 바꿔 쓰세요.
+`pkgman add-repo`가 `Operation not supported`로 실패하면 그 시스템의 네트워크
+키트가 TLS 없이 빌드된 것입니다(RenkuOS arm64 이미지에는 있습니다). 주소의
+`https://`를 `http://`로 바꿔 쓰세요.
 
 패키지는 `tailscale`, `tailscaled`, R Tailscale(Deskbar -> 응용 프로그램),
 로그인할 때 서비스를 시작하는 launch 작업을 설치합니다. 설치 직후 다음
 로그인 전까지는 R Tailscale이 서비스를 직접 시작합니다.
 
 arm64와 x86_64에서는 서비스가 TUN 인터페이스를 씁니다. 모든 프로그램이
-tailnet에 바로 접속하고(IPv4) MagicDNS 이름이 시스템 전체에서 풀리며, 이를
-위해 서비스가 도는 동안 시스템의 `resolv.conf`가 바뀝니다. 자세한 내용과
-대체 동작은 [docs/PORTING.ko.md](docs/PORTING.ko.md#사용)에 있습니다.
+tailnet에 바로 접속하고 MagicDNS 이름이 시스템 전체에서 풀리며, 이를 위해
+서비스가 도는 동안 시스템의 `resolv.conf`가 바뀝니다. tailnet에는 IPv4로
+접속합니다. IPv6는 아직 배포된 이미지에 들어 있지 않은 수정이 적용된 Haiku
+네트워크 스택이 있어야 합니다. 네트워크 변화(케이블이나 Wi-Fi 링크가
+끊겼다 돌아오는 것 등)는 서비스가 스스로 따라갑니다. 자세한 내용과 대체
+동작은 [docs/PORTING.ko.md](docs/PORTING.ko.md#사용)에 있습니다.
+
+같은 문서에 Tailscale SSH 서버(`tailscale up --ssh`), 서브넷 라우트 광고와
+이 기기를 exit node로 제공하는 방법, 다른 기기를 exit node로 쓰는 방법
+(`tailscale set --exit-node=<이름>`)도 있습니다.
 
 ## 로그인
 

@@ -21,7 +21,8 @@ Tailscale Inc.와는 관계가 없습니다.
 build.sh                 arm64 또는 x86_64용 tailscale + tailscaled 빌드
 install.sh               dist/<arch>/를 ~/config/non-packaged에 설치
 patches/                 tailscale 소스에 대한 64비트용 변경
-deps/                    의존성 두 개(wireguard-go, gvisor)에 대한 변경
+patches/haiku/           TUN에서 IPv6를 위한 Haiku 네트워크 스택 수정 (패키지에 미포함)
+deps/                    의존성 세 개(wireguard-go, gvisor, pkg/sftp)에 대한 변경
 packaging/               tailscaled-service(데몬 실행 방식), launch 작업
 tools/make-hpkg.sh       설치 패키지 생성 (RenkuOS에서 실행)
 gui/                     네이티브 창 R Tailscale
@@ -36,20 +37,24 @@ i386/                    32비트 x86 포트 (자체 README와 스크립트 포�
 런처는 시작이 성공할 때까지 데몬을 다시 띄웁니다.
 
 64비트 Go 포트에는 이런 결함이 없으므로 그 코드를 가져오지 않았습니다.
-64비트 패치는 15개 파일 약 350줄이고(절반은 TUN 인터페이스용 라우터),
-Haiku 자체가 요구하는 것만 합니다.
+64비트 패치는 38개 파일에 약 1,400줄을 더하며, Haiku 자체가 요구하는 것만
+합니다.
 
 | 변경 | 이유 |
 | --- | --- |
-| `wgengine/router/osrouter`: Haiku용 라우터 | `ifconfig`와 `route`로 tun 인터페이스의 주소와 tailnet 경로를 설정 |
+| `wgengine/router/osrouter`: Haiku용 라우터 | `ifconfig`와 `route`로 tun 인터페이스의 주소(IPv4, 스택이 허용하면 IPv6도)와 tailnet 경로를 설정. exit node의 기본 경로는 `1.0.0.0/8`부터 `128.0.0.0/1`까지 경로 여덟 개로 넣음 |
 | `net/dns`: 시스템의 `resolv.conf` 기록 | Haiku의 리졸버는 `/etc/resolv.conf`가 아니라 `/boot/system/settings/network/resolv.conf`를 읽음 |
 | `cmd/tailscaled`: 기본값을 `userspace-networking`으로 | 터널 드라이버가 모든 이미지에 있지는 않음. 서비스가 `tun`을 먼저 요청하고 안 되면 전환 |
 | `paths`: 소켓과 상태를 `~/config/settings/tailscale`에 | Haiku에는 `/var/run`, `/var/lib` 관례가 없음 |
 | `paths`, `cmd/tailscale/cli`: `golang.org/x/sys/unix` 호출 제거 | 이 모듈은 Haiku를 지원하지 않음 |
 | `ipn/ipnserver`: 피어 자격 증명 없이 LocalAPI 클라이언트 허용 | Haiku가 이를 제공하지 않음. 소켓은 소유자 설정 디렉터리의 0600 모드 |
-| `net/netmon`: 경로 조회로 로컬 주소 확인 | Haiku에서 Go의 `net.Interfaces()`가 빈 목록을 돌려주고, 인터페이스가 없으면 netcheck가 STUN 탐색을 모두 건너뛰어 릴레이 전용이 됨 |
+| `net/netmon`: ioctl로 인터페이스와 기본 경로를 읽고 변화를 감시 | Haiku에서 Go의 `net.Interfaces()`가 빈 목록을 돌려주고, 인터페이스가 없으면 netcheck가 STUN 탐색을 모두 건너뛰어 릴레이 전용이 됨. 변화는 네트워크 스택의 알림으로 받음([네트워크 변화](#네트워크-변화) 참고) |
+| `net/dns`: `resolv.conf` 감시 | net_server가 DHCP 임대마다 이 파일을 새로 씀. 데몬이 2초 안에 알아채고 자기 리졸버를 되돌려 놓음 |
+| `ssh/tailssh`, `util/osuser`, `feature/ssh`: Haiku에서 Tailscale SSH 서버 | PTY, 터미널 모드, 창 크기를 libroot의 `ioctl`로 처리하고, 사용자와 셸은 `/etc/passwd`에서 읽으며, `login`이나 `su`를 쓰지 않음 |
+| `cmd/tailscaled`: 서브넷과 exit node 트래픽을 netstack에서 처리 | Haiku의 IPv4 스택은 패킷 전달도 주소 변환도 하지 않음 |
+| `net/netns`, `wgengine/magicsock`: 데몬 자신의 트래픽을 터널 밖으로 | exit node가 기본 경로를 가진 동안 필요함. Haiku에는 정책 라우팅도 소켓 마크도 없음 |
 
-`deps/`에는 두 가지가 더 있습니다.
+`deps/`에는 세 가지가 더 있습니다.
 
 - **wireguard-go**: 빌드 태그 네 개를 고쳐 스텁 구현이 쓰이게 하고, TUN 장치인
   `tun/tun_haiku.go`를 더합니다. Haiku의 터널 드라이버에는 클론 장치가 없습니다.
@@ -59,6 +64,18 @@ Haiku 자체가 요구하는 것만 합니다.
   `crypto/rand`로 초기화하는데 Haiku의 `getentropy`가 8KiB를 만들어내는 데
   매우 오래 걸릴 수 있어, RenkuOS/arm64에서 이 초기화 하나가 시작을 36~45초
   붙잡았습니다. 변경 후에는 2초 안에 백엔드가 준비됩니다.
+- **pkg/sftp**: Tailscale SSH의 SFTP 하위 시스템을 위한 빌드 태그 두 개.
+
+이 중 일부는 Go의 Haiku용 `syscall` 패키지가 제공하지 않는 함수(`ioctl`,
+포트, 네트워크 알림이 쓰는 generic syscall)가 필요합니다. 모두 Haiku의 모든
+Go 바이너리가 링크하는 `libroot.so`의 평범한 함수이므로,
+`golang.org/x/sys/unix`가 Solaris에서 libc를 부르는 방식대로
+`//go:cgo_import_dynamic` 선언과 `syscall.sysvicall6`로 cgo 없이 부릅니다.
+`net/netmon`과 `ssh/tailssh`가 각각 `__ioctl`을 선언하며, 링커가 둘을 하나의
+import로 합칩니다.
+
+`patches/haiku/haiku-tun-ipv6.patch`는 빌드에 쓰이지 않습니다. Haiku 자체에
+대한 변경입니다. [IPv6](#ipv6)를 보세요.
 
 ## 설치
 
@@ -71,7 +88,7 @@ Haiku 자체가 요구하는 것만 합니다.
 또는 `tools/make-hpkg.sh`로 만든 패키지로 설치합니다.
 
 ```sh
-pkgman install ./renkuos_rtailscale-1.102.0-4-arm64.hpkg
+pkgman install ./renkuos_rtailscale-1.102.0-5-arm64.hpkg
 ```
 
 패키지는 `tailscale`, `tailscaled`, `tailscaled-service`, R Tailscale(응용
@@ -95,15 +112,16 @@ ssh user@mac-mini
 
 이 모드에서 알아 둘 세 가지입니다.
 
-- **IPv4만 됩니다.** 터널 드라이버가 IPv6 주소를 거부하므로 tailnet의
-  `fd7a:...` 주소는 설정되지 않습니다.
+- **IPv4는 되고, IPv6는 수정된 네트워크 스택에서만 됩니다.** [IPv6](#ipv6)를
+  보세요.
 - **서비스가 도는 동안 `resolv.conf`가 바뀝니다.** 원본은 옆에
   `resolv.pre-tailscale-backup.conf`로 보관됩니다. `tailscale set
-  --accept-dns=false`를 쓰면 건드리지 않습니다. `tailscaled-service`는 데몬이
-  어떻게 끝나든 끝난 뒤에, 그리고 다음 시작 전에 파일을 되돌립니다.
-  net_server가 인터페이스를 다시 설정할 때(예: DHCP 갱신) 이 파일을 새로
-  쓰는데, 그러면 tailscaled가 설정을 다시 적용할 때까지 tailnet 리졸버가
-  빠집니다.
+  --accept-dns=false`를 쓰면 건드리지 않습니다. 데몬은 SIGTERM이나 SIGINT로
+  멈출 때 파일을 되돌리고, `tailscaled-service`는 데몬이 끝난 뒤와 다음 시작
+  전에 `tailscaled --cleanup`을 실행하므로 `kill -9`로 죽은 경우도
+  처리됩니다. net_server가 인터페이스를 다시 설정할 때(예: DHCP 갱신) 이
+  파일을 새로 쓰면, 데몬이 파일을 감시하다가 2초쯤 안에 자기 내용을 다시
+  씁니다.
 - **서비스가 멈출 때 인터페이스는 지우지 않고 내립니다.** 다음 시작에서 다시
   씁니다. 장치를 닫은 직후에 인터페이스를 지우면 그 이름을 한동안 쓸 수 없게
   될 수 있습니다.
@@ -130,6 +148,97 @@ ssh -o ProxyCommand='tailscale nc %h %p' user@100.x.y.z
 
 R Tailscale의 **SSH** 버튼은 선택한 기기에 대해 바로 이 명령을 터미널 창에서
 실행합니다.
+
+### 네트워크 변화
+
+데몬은 Haiku의 `ifconfig`와 `route`가 쓰는 ioctl로 커널에서 인터페이스,
+주소, 플래그, 기본 경로를 읽습니다. 인터페이스가 생기거나 사라지거나 바뀔 때,
+링크가 올라가거나 내려갈 때 오는 네트워크 스택의 알림(`start_watching_network()`가
+감싸는 포트 인터페이스)을 구독하고, 경로 변화에는 알림이 없으므로 5초마다
+라우팅 테이블도 확인합니다. 장치의 링크가 끊긴 인터페이스는 내려간 것으로
+봅니다. 그래서 케이블을 뽑거나 Wi-Fi가 끊기면 노드가 멈추고("all links
+down"), 링크가 돌아오면 재시작 없이 소켓을 다시 묶고 공인 주소를 다시 찾아
+다시 연결합니다.
+
+### IPv6
+
+라우터는 tun 인터페이스에 IPv4와 함께 노드의 IPv6 주소(`fd7a:...`)와
+tailnet의 IPv6 경로도 설정합니다. 배포된 이미지의 Haiku 네트워크 스택은 터널
+인터페이스에 이 주소를 거부합니다(`ifconfig: Setting address failed: Invalid
+Argument`). 터널 장치용 IPv6 datalink 프로토콜을 등록하지 않기 때문입니다.
+그러면 데몬은 한 번 로그를 남기고 IPv4만으로 계속하며, IPv4는 전과 같이
+동작합니다.
+
+`patches/haiku/haiku-tun-ipv6.patch`가 그 수정으로, tailscale이 아니라
+Haiku 네트워크 스택(`stack`과 `loopback_frame` datalink 프로토콜)에 대한
+것입니다. 이것을 적용하면 인터페이스가 IPv6 주소를 받아들이고 tailnet에
+IPv6로도 접속됩니다. 커널 애드온을 바꿔야 하므로 이 패키지에는 넣지
+않았습니다. 패치의 설명을 보세요. IPv6 기본 경로(exit node의 `::/0`)는 넣지
+않으므로, exit node를 쓸 때 인터넷으로 가는 IPv6 트래픽은 exit node를 거치지
+않습니다.
+
+### Tailscale SSH
+
+데몬이 키나 비밀번호 대신 tailnet의 신원과 접근 규칙으로 tailnet에 SSH를
+직접 제공할 수 있습니다.
+
+```sh
+tailscale up --ssh            # 또는: tailscale set --ssh
+ssh user@this-machine         # tailnet의 다른 기기에서
+```
+
+누가 어떤 사용자로 로그인할 수 있는지는 tailnet 정책의 `ssh` 규칙이 정하고,
+`check` 규칙은 다른 곳과 마찬가지로 먼저 브라우저에서 다시 로그인하게 합니다.
+사용자 이름은 이 기기의 것입니다. Haiku에는 계정이 하나 있고(Haiku는 `user`,
+RenkuOS는 `baron`), 홈과 셸은 `/etc/passwd`에서 읽습니다. 정책의 `ssh`
+규칙에서 그 이름을 허용하세요(`"users": ["baron"]`).
+
+Linux와 다른 점입니다.
+
+- `login`, `su`, PAM이 없습니다. `/etc/passwd`의 셸을 사용자 홈에서 바로
+  실행하고, `PATH`는 Haiku의 Terminal과 같게 설정합니다.
+- Haiku의 모든 사용자는 UID 0이므로, 세션은 로컬 Terminal처럼 기기 전체에
+  대한 권한을 가집니다.
+- 대화형 세션은 클라이언트의 터미널 모드와 창 크기를 적용한 의사 터미널을
+  받습니다. SFTP 하위 시스템이 들어 있습니다.
+
+### 서브넷 라우터와 exit node
+
+이 기기가 LAN이나 인터넷 전체로 가는 경로를 tailnet에 제공할 수 있고, 자신의
+인터넷 트래픽을 다른 기기로 보낼 수도 있습니다.
+
+```sh
+tailscale set --advertise-routes=192.168.1.0/24   # 그다음 관리 콘솔에서 승인
+tailscale set --advertise-exit-node               # 마찬가지
+tailscale set --exit-node=<기기>                  # 다른 기기를 사용, 승인 불필요
+tailscale set --exit-node=                        # 사용 중지
+```
+
+**경로나 exit node 제공**은 FreeBSD, Windows와 같이 netstack으로 동작합니다.
+tailnet에서 광고한 네트워크로 가는 패킷은 데몬 자체의 TCP/IP 스택에서 끝나고,
+데몬이 실제 목적지로 평범한 소켓을 엽니다. Haiku의 IPv4 스택은 패킷 전달도
+주소 변환도 하지 않으므로 커널 라우팅 테이블은 여기에 쓰이지 않습니다. TCP와
+UDP를 전달하고, ping에는 Haiku의 `ping`을 실행해 응답합니다.
+
+**exit node 사용**은 시스템 경로를 바꿉니다. 기본 경로를 바꾸지 않고,
+`tun/0`을 거치는 `1.0.0.0/8`부터 `128.0.0.0/1`까지의 경로 여덟 개가 인터넷을
+덮어 기본 경로보다 우선하며, 물리 기본 경로는 남습니다(`route`가 `0.0.0.0`으로
+가는 경로를 모두 기본 경로로 받아들이므로 `0.0.0.0/8`은 뺍니다). LAN은 그
+on-link 경로가 더 구체적이므로 계속 닿습니다. 데몬 자신의 트래픽(컨트롤
+서버, DERP, STUN, exit node와 다른 피어로 가는 WireGuard)이 터널로 되돌아
+들어가지 않도록, 데몬이 통신하는 원격 주소마다 첫 패킷 전에 물리 게이트웨이를
+거치는 호스트 경로를 넣습니다. exit node를 끄거나 데몬을 SIGTERM으로 멈추면
+이 경로를 모두 다시 지웁니다.
+
+한계입니다.
+
+- IPv4만: IPv6 기본 경로는 없습니다(위 참고).
+- 데몬을 `kill -9`로 죽이면 `tun/0` 경로는 인터페이스와 함께 사라지지만
+  (`--cleanup`이 인터페이스를 내림), 물리 게이트웨이를 거치는 호스트 경로는
+  다음 재시작이나 `route delete` 전까지 남습니다. 어차피 기본 경로와 같은
+  곳을 가리키므로 해는 없지만, 네트워크가 바뀌면 낡은 경로가 됩니다. exit
+  node를 쓰는 중에 네트워크의 게이트웨이가 바뀐 경우도 같으니 서비스를 다시
+  시작하세요.
 
 CLI에는 `--socket` 옵션이 필요 없습니다. 포트의 기본 경로가 서비스가 쓰는
 경로와 같습니다.
@@ -254,32 +363,66 @@ revision 3은 arm64 전용입니다. 같은 소스를, 시작할 때 `234567`을
 version`이 버전만 출력하고, 서비스가 `tun/0`을 열고, MagicDNS 이름으로 피어에
 `ping`과 sshd 배너 읽기가 되고, Mac mini에서 ping이 돌아옴을 확인했습니다.
 
+arm64의 revision 5(RenkuOS 라이브 이미지, hrev60072, 시그널 수정이 들어간
+Go 툴체인)와 x86_64의 revision 4(Haiku nightly hrev60450)를 둘 다 QEMU에서,
+파일로 `pkgman install`해 설치하고 `tailscaled-service`로 서비스를 시작해
+로그인한 TUN 모드에서 확인했습니다.
+
+- 둘 다: `tun/0`이 노드의 IPv4 주소로 올라옴. MagicDNS 이름으로 `ping
+  mac-mini`와 그 피어의 HTTP 서버에 `curl`이 됨. `tailscaled`에 `kill -TERM`을
+  보내면 멈추고 서비스 스크립트가 끝나며, `tun/0`이 내려가고 tailnet 경로가
+  사라지고 `resolv.conf`가 DHCP의 것으로 돌아옴. 다시 시작하면 노드가 돌아오고
+  피어가 응답함
+- 둘 다: 기본 스택이 IPv6 주소를 거부하고, 한 번 로그를 남긴 뒤 IPv4는 그대로
+  동작함
+- arm64: QEMU `set_link`로 가상 NIC의 링크를 껐다 켬. 데몬이 "all links down;
+  pausing"을 남기고, 링크가 돌아오자 "LinkChange: major, rebinding"을 남김.
+  피어에 다시 직접 연결됨
+- arm64: `tailscale up --ssh`가 받아들여지고 호스트 키가 게시됨. tailnet의
+  Mac(OpenSSH)에서 정책의 check를 브라우저로 승인한 뒤: 명령이 `baron`(UID 0,
+  셸 `/bin/bash`)으로 실행되고 종료 상태가 돌아옴. 원격 명령에 파이프한
+  stdin이 도착함. 대화형 세션이 클라이언트 창 크기로 `/dev/tt/p0`을 받고,
+  크기 변경(SIGWINCH)을 따르며, Ctrl-C가 `cat`을 중단하고, `exit 4`가 4로
+  돌아옴. `scp`(SFTP와 예전 `-O` 프로토콜)와 `sftp`가 300KB 파일을 양방향으로
+  복사하고 체크섬이 일치함
+- arm64: `tailscale set --exit-node=tokyo`. `tun/0`을 거치는 경로 여덟 개와
+  데몬의 피어, DERP, 컨트롤 서버로 가는 물리 게이트웨이 경유 호스트 경로가
+  생기고, 인터넷에서 보이는 공인 주소가 exit node의 것으로 바뀌며, tailnet
+  피어에도 계속 닿음. `--exit-node=`로 경로가 지워지고 라우팅 테이블과
+  `resolv.conf`가 이전과 바이트 단위로 같음. exit node를 켠 채 데몬을
+  `kill -9`: 서비스의 정리가 `tun/0`과 그 경로를 없애고 `resolv.conf`를
+  되돌림. 게이트웨이 경유 호스트 경로 네 개는 한계에 적은 대로 남음. 다시
+  시작하니 exit node가 다시 쓰임(설정이 유지됨)
+- x86_64: 패키지가 `/system`에 있는 상태로 기기를 다시 시작하니 launch 작업이
+  서비스를 시작했고(`launch_roster info`에 실행 중으로 표시됨) 노드가 tailnet에
+  돌아옴. 지켜본 6분 동안 계속 떠 있었고 피어에 닿음
+- x86_64, 미해결: 패키지를 다시 설치하고 ssh 세션에서 서비스를 손으로 시작한
+  지 10분쯤 뒤에 데몬이 없어진 것을 한 번 발견함. 기기를 꺼 버려 로그를 잃었고,
+  다시 재현되지 않음
+
 확인하지 않은 내용입니다.
 
 - **TUN 모드에서**: 연결 중의 DHCP 갱신, 잠자기 후 깨어남, 서브넷 라우트
-  수락, IPv6 전반
+  수락. x86_64에서의 네트워크 변화와 exit node
+- tailnet 위의 **IPv6**: Haiku 스택 수정이 필요하며 이 시험에는 포함하지 않음
+- 이 패키지로 서브넷 라우트나 exit node를 **제공**하는 것(관리자 승인이 필요함)
 
 - **x86_64에서**: R Tailscale의 SSH와 IP 복사 버튼, 들어오는 연결
 - **32비트에서**: 이 패키지로 로그인 링크 이후의 동작(i386 포트 자체는 로그인된
   기기에서 개발했습니다. `i386/` 참고)
-- **`/system`에 설치된 패키지의 launch 작업**: `~/config/packages`의 패키지로는
-  동작을 확인했지만, `pkgman install` 뒤에는 기기를 재시작하지 않았습니다.
-- Tailscale SSH 서버, serve/funnel, 출구 노드, 서브넷 라우트: 최소 빌드에서
-  빠져 있습니다.
+- **arm64에서 `/system`에 설치된 패키지의 launch 작업**: x86_64와
+  `~/config/packages`의 패키지로는 동작을 확인했습니다.
+- serve/funnel, Taildrop 등 최소 빌드에서 빠진 기능
 
 ## 알려진 한계
 
-- 인터페이스 모니터는 주소 체계마다 호스트 길이 프리픽스를 가진 가상
-  인터페이스 하나를 보고합니다. 네트워크가 붙고 끊기는 것은 알지만
-  인터페이스 이름이나 LAN 프리픽스는 모릅니다.
 - 출력을 일찍 끝나는 프로그램으로 파이프한 `tailscale` 명령
   (`tailscale netcheck | head`)이 SIGPIPE로 죽지 않고 멈추는 것이
   관찰됐습니다. 파일로 리다이렉트하거나 끝까지 실행하세요.
-- **데몬이 SIGTERM이나 SIGINT로 멈추지 않습니다.** tailscale이 아니라 Go
-  런타임 문제입니다. 같은 haiku/arm64 툴체인으로 빌드한 최소 Go 프로그램도
-  `signal.Notify` 사용 여부와 관계없이 두 시그널을 무시합니다. 서비스는
-  `kill -9 <team>`으로 멈추세요. 상태 파일은 바뀔 때마다 기록되고, 다음 시작
-  때 남은 소켓을 교체합니다. x86_64에서는 데몬이 SIGTERM으로 멈춥니다.
+- `kill -9`로 죽은 데몬은 정리를 하지 못합니다. 그러면 `tailscaled-service`가
+  `resolv.conf`를 되돌리고 인터페이스를 내리지만, exit node용 호스트 경로는
+  남습니다([서브넷 라우터와 exit node](#서브넷-라우터와-exit-node) 참고).
+  대신 `kill <team>`(SIGTERM)으로 멈추세요.
 - R Tailscale은 로그인 링크를 기본 브라우저로 엽니다. arm64 시험 이미지에서는
   WebPositive가 시작 중에(WebKit의 시간대 설정 단계에서, 아무것도 불러오기
   전에) 죽었습니다. 링크는 창에 남아 있고 **링크 복사** 버튼이 있으며, 다른

@@ -14,7 +14,7 @@ what was changed and why.
 | --- | --- | --- |
 | arm64 | `patches/` + `build.sh`, Go from [renkuos-golang](https://github.com/rainygirl/renkuos-golang) | built and run on RenkuOS arm64 (see [Verified](#verified)) |
 | x86_64 | the same `patches/` + `build.sh`, Go from [korli/go](https://github.com/korli/go) | built with `build.sh x86_64` and run on Haiku x86_64, signed in to a tailnet (see [Verified](#verified)); not run on RenkuOS x86_64 |
-| x86 (32-bit) | [`i386/`](../i386/), a separate and much larger port | as published in renkuos-i386-tailscale-patch, unchanged |
+| x86 (32-bit) | [`i386/`](../i386/), a separate and much larger port | the port is unchanged; packaged with R Tailscale as `renkuos_rtailscale_x86` and run up to sign-in on Haiku x86_gcc2 |
 
 ## Layout
 
@@ -203,10 +203,25 @@ from `build.sh x86_64` and korli/go (golang-1.27-haiku, Go 1.27.4):
 - R Tailscale shows the connected state and the peer list with
   direct/relay/offline
 
+The packages, as published on pkgman.rainygirl.com:
+
+- arm64 (RenkuOS) and x86_64 (Haiku nightly): `pkgman install
+  renkuos_rtailscale` from the repository installs into `/system`, the
+  service started from there rejoins the tailnet, and R Tailscale shows the
+  connected state with its icon in the Deskbar
+- 32-bit (Haiku x86_gcc2 nightly hrev60450 under QEMU): `pkgman install
+  renkuos_rtailscale_x86`, then `tailscaled-service` runs the i386 launcher,
+  the daemon becomes ready, and R Tailscale shows the sign-in link
+
 Not verified:
 
-- **on x86_64**: R Tailscale's SSH and Copy IP buttons, inbound
-  connections, and the package
+- **on x86_64**: R Tailscale's SSH and Copy IP buttons, and inbound
+  connections
+- **on 32-bit**: anything past the sign-in link with this package (the
+  i386 port itself was developed on a signed-in machine; see `i386/`)
+- **the launch job of a package in `/system`**: seen working for a package
+  in `~/config/packages`; after `pkgman install` the machines were not
+  restarted
 - Tailscale SSH server, serve/funnel, exit nodes, and subnet routes: the
   minimal build omits them
 

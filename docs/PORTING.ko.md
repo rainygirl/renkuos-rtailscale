@@ -13,7 +13,7 @@ Tailscale Inc.와는 관계가 없습니다.
 | --- | --- | --- |
 | arm64 | `patches/` + `build.sh`, Go는 [renkuos-golang](https://github.com/rainygirl/renkuos-golang) | RenkuOS arm64에서 빌드하고 실행함 ([검증](#검증) 참고) |
 | x86_64 | 같은 `patches/` + `build.sh`, Go는 [korli/go](https://github.com/korli/go) | `build.sh x86_64`로 빌드해 Haiku x86_64에서 실행, tailnet 로그인까지 확인([검증](#검증) 참고). RenkuOS x86_64에서는 실행하지 않음 |
-| x86 (32비트) | [`i386/`](../i386/), 별도의 훨씬 큰 포트 | renkuos-i386-tailscale-patch에 공개된 그대로 |
+| x86 (32비트) | [`i386/`](../i386/), 별도의 훨씬 큰 포트 | 포트는 그대로이며, R Tailscale과 함께 `renkuos_rtailscale_x86`으로 패키징해 Haiku x86_gcc2에서 로그인 전까지 실행 |
 
 ## 구성
 
@@ -191,9 +191,22 @@ korli/go(golang-1.27-haiku, Go 1.27.4)로 만든 바이너리로 확인한 내�
 - R Tailscale이 연결됨 상태와 직접/릴레이/오프라인이 표시된 피어 목록을
   보여 줌
 
+pkgman.rainygirl.com에 게시한 패키지로 확인한 내용입니다.
+
+- arm64(RenkuOS)와 x86_64(Haiku nightly): 저장소에서 `pkgman install
+  renkuos_rtailscale`로 `/system`에 설치되고, 거기서 시작한 서비스가 tailnet에
+  다시 연결되며, R Tailscale이 연결됨 상태를 보여 주고 Deskbar에 아이콘이 나옴
+- 32비트(QEMU의 Haiku x86_gcc2 nightly hrev60450): `pkgman install
+  renkuos_rtailscale_x86` 후 `tailscaled-service`가 i386 실행기를 실행하고,
+  데몬이 준비되며, R Tailscale이 로그인 링크를 표시함
+
 확인하지 않은 내용입니다.
 
-- **x86_64에서**: R Tailscale의 SSH와 IP 복사 버튼, 들어오는 연결, 패키지
+- **x86_64에서**: R Tailscale의 SSH와 IP 복사 버튼, 들어오는 연결
+- **32비트에서**: 이 패키지로 로그인 링크 이후의 동작(i386 포트 자체는 로그인된
+  기기에서 개발했습니다. `i386/` 참고)
+- **`/system`에 설치된 패키지의 launch 작업**: `~/config/packages`의 패키지로는
+  동작을 확인했지만, `pkgman install` 뒤에는 기기를 재시작하지 않았습니다.
 - Tailscale SSH 서버, serve/funnel, 출구 노드, 서브넷 라우트: 최소 빌드에서
   빠져 있습니다.
 

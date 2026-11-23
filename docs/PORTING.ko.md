@@ -37,7 +37,7 @@ i386/                    32비트 x86 포트 (자체 README와 스크립트 포�
 런처는 시작이 성공할 때까지 데몬을 다시 띄웁니다.
 
 64비트 Go 포트에는 이런 결함이 없으므로 그 코드를 가져오지 않았습니다.
-64비트 패치는 38개 파일에 약 1,400줄을 더하며, Haiku 자체가 요구하는 것만
+64비트 패치는 39개 파일에 약 1,500줄을 더하며, Haiku 자체가 요구하는 것만
 합니다.
 
 | 변경 | 이유 |
@@ -88,7 +88,7 @@ import로 합칩니다.
 또는 `tools/make-hpkg.sh`로 만든 패키지로 설치합니다.
 
 ```sh
-pkgman install ./renkuos_rtailscale-1.102.0-5-arm64.hpkg
+pkgman install ./renkuos_rtailscale-1.102.0-6-arm64.hpkg
 ```
 
 패키지는 `tailscale`, `tailscaled`, `tailscaled-service`, R Tailscale(응용
@@ -228,17 +228,16 @@ on-link 경로가 더 구체적이므로 계속 닿습니다. 데몬 자신의 �
 서버, DERP, STUN, exit node와 다른 피어로 가는 WireGuard)이 터널로 되돌아
 들어가지 않도록, 데몬이 통신하는 원격 주소마다 첫 패킷 전에 물리 게이트웨이를
 거치는 호스트 경로를 넣습니다. exit node를 끄거나 데몬을 SIGTERM으로 멈추면
-이 경로를 모두 다시 지웁니다.
+이 경로를 모두 다시 지웁니다. 이 경로들은 있는 동안 상태 디렉터리의
+`bypass-routes`에도 기록되므로, `kill -9`로 죽은 데몬의 경로는
+`tailscaled --cleanup`(`tailscaled-service`가 데몬이 끝난 뒤 실행함)이나 다음
+시작이 지웁니다.
 
 한계입니다.
 
 - IPv4만: IPv6 기본 경로는 없습니다(위 참고).
-- 데몬을 `kill -9`로 죽이면 `tun/0` 경로는 인터페이스와 함께 사라지지만
-  (`--cleanup`이 인터페이스를 내림), 물리 게이트웨이를 거치는 호스트 경로는
-  다음 재시작이나 `route delete` 전까지 남습니다. 어차피 기본 경로와 같은
-  곳을 가리키므로 해는 없지만, 네트워크가 바뀌면 낡은 경로가 됩니다. exit
-  node를 쓰는 중에 네트워크의 게이트웨이가 바뀐 경우도 같으니 서비스를 다시
-  시작하세요.
+- 호스트 경로는 exit node를 켰을 때의 기본 게이트웨이를 거칩니다. exit node를
+  쓰는 중에 네트워크의 게이트웨이가 바뀌면 서비스를 다시 시작하세요.
 
 CLI에는 `--socket` 옵션이 필요 없습니다. 포트의 기본 경로가 서비스가 쓰는
 경로와 같습니다.
@@ -419,10 +418,11 @@ Go 툴체인)와 x86_64의 revision 4(Haiku nightly hrev60450)를 둘 다 QEMU�
 - 출력을 일찍 끝나는 프로그램으로 파이프한 `tailscale` 명령
   (`tailscale netcheck | head`)이 SIGPIPE로 죽지 않고 멈추는 것이
   관찰됐습니다. 파일로 리다이렉트하거나 끝까지 실행하세요.
-- `kill -9`로 죽은 데몬은 정리를 하지 못합니다. 그러면 `tailscaled-service`가
-  `resolv.conf`를 되돌리고 인터페이스를 내리지만, exit node용 호스트 경로는
-  남습니다([서브넷 라우터와 exit node](#서브넷-라우터와-exit-node) 참고).
-  대신 `kill <team>`(SIGTERM)으로 멈추세요.
+- `kill -9`로 죽은 데몬은 스스로 정리하지 못합니다. 그 뒤 `tailscaled-service`가
+  실행하는 `tailscaled --cleanup`이 `resolv.conf`를 되돌리고 인터페이스를 내리고
+  exit node용 호스트 경로를 지웁니다. 서비스 없이 손으로 시작한 데몬이 그렇게
+  죽었다면 다음 시작 때 같은 일을 합니다. 깔끔하게 멈추려면 여전히
+  `kill <team>`(SIGTERM)을 쓰세요.
 - R Tailscale은 로그인 링크를 기본 브라우저로 엽니다. arm64 시험 이미지에서는
   WebPositive가 시작 중에(WebKit의 시간대 설정 단계에서, 아무것도 불러오기
   전에) 죽었습니다. 링크는 창에 남아 있고 **링크 복사** 버튼이 있으며, 다른

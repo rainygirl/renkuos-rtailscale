@@ -38,7 +38,7 @@ startup. Its tailscale patch is about 2,700 lines, most of it avoiding those
 faults, and its launcher restarts the daemon until a start succeeds.
 
 The 64-bit Go ports do not have those faults, so none of that is carried
-over. The 64-bit patch adds about 1,400 lines in 38 files and only does
+over. The 64-bit patch adds about 1,500 lines in 39 files and only does
 what Haiku itself requires:
 
 | change | why |
@@ -89,7 +89,7 @@ Without a package, from a checkout that has `dist/<arch>/` built:
 Or with a package built by `tools/make-hpkg.sh`:
 
 ```sh
-pkgman install ./renkuos_rtailscale-1.102.0-5-arm64.hpkg
+pkgman install ./renkuos_rtailscale-1.102.0-6-arm64.hpkg
 ```
 
 The package installs `tailscale`, `tailscaled`, `tailscaled-service`,
@@ -237,16 +237,17 @@ WireGuard to the exit node and the other peers) does not loop into the
 tunnel, each remote address it talks to gets a host route through the
 physical gateway before its first packet. Turning the exit node off, or
 stopping the daemon with SIGTERM, removes all of these routes again.
+While they exist they are also listed in `bypass-routes` in the state
+directory, so that those of a daemon killed with `kill -9` are removed by
+`tailscaled --cleanup` (which `tailscaled-service` runs after the daemon
+ends) or by the next start.
 
 Limits:
 
 - IPv4 only: no IPv6 default route (see above).
-- After `kill -9` of the daemon, the `tun/0` routes go with the interface
-  (`--cleanup` takes it down), but the host routes through the physical
-  gateway stay until the next restart or `route delete`. They point where
-  the default route points anyway, so they do no harm, but they go stale if
-  the network changes. The same if the network's gateway changes while the
-  exit node is in use: restart the service.
+- The host routes go through the gateway that was the default when the
+  exit node was turned on. If the network's gateway changes while the exit
+  node is in use, restart the service.
 
 The CLI needs no `--socket` option; the port's default path is the one the
 service uses:
@@ -445,11 +446,12 @@ Not verified:
 - A `tailscale` command whose output is piped into a program that exits
   early (`tailscale netcheck | head`) has been seen to hang instead of
   dying from SIGPIPE. Redirect to a file, or let it finish.
-- A daemon killed with `kill -9` cannot clean up: `tailscaled-service`
-  then restores `resolv.conf` and takes the interface down, but host routes
-  added for an exit node stay (see [Subnet router and exit
-  node](#subnet-router-and-exit-node)). Stop it with `kill <team>`
-  (SIGTERM) instead.
+- A daemon killed with `kill -9` cannot clean up itself; the
+  `tailscaled --cleanup` that `tailscaled-service` runs afterwards restores
+  `resolv.conf`, takes the interface down and removes an exit node's host
+  routes. A daemon killed that way and started by hand, without the
+  service, does the same when it next starts. `kill <team>` (SIGTERM)
+  remains the clean way to stop it.
 - R Tailscale opens the sign-in link in the default browser. On the arm64
   test image WebPositive crashed while starting (inside WebKit's time zone
   setup, before loading anything). The link stays in the window with a

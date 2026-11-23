@@ -395,14 +395,57 @@ Go 툴체인)와 x86_64의 revision 4(Haiku nightly hrev60450)를 둘 다 QEMU�
 - x86_64: 패키지가 `/system`에 있는 상태로 기기를 다시 시작하니 launch 작업이
   서비스를 시작했고(`launch_roster info`에 실행 중으로 표시됨) 노드가 tailnet에
   돌아옴. 지켜본 6분 동안 계속 떠 있었고 피어에 닿음
-- x86_64, 미해결: 패키지를 다시 설치하고 ssh 세션에서 서비스를 손으로 시작한
-  지 10분쯤 뒤에 데몬이 없어진 것을 한 번 발견함. 기기를 꺼 버려 로그를 잃었고,
-  다시 재현되지 않음
+- x86_64: 패키지를 다시 설치하고 ssh 세션에서 서비스를 손으로 시작한 지
+  10분쯤 뒤에 데몬이 없어진 것을 한 번 발견함. 기기를 꺼 버려 로그를 잃었음.
+  이후 재현되지 않음(아래 참고)
+
+arm64의 revision 6과 x86_64의 revision 5(위와 같은 QEMU 기기, 파일로 설치,
+로그인한 TUN 모드)에서는 exit node의 호스트 경로가 기록되고 `kill -9` 뒤에
+지워짐을 확인했습니다.
+
+- arm64: `--exit-node=tokyo`(공인 주소가 exit node의 것이고, `bypass-routes`에
+  고정된 호스트 경로가 적힘)에서 데몬을 `kill -9`: 서비스의 `--cleanup`이 호스트
+  경로 13개를 모두 지웠고, 라우팅 테이블(`route list inet`을 정렬한 md5)이
+  서비스를 처음 시작하기 전과 같았음. 다시 시작하니 exit node가 다시 쓰였고,
+  이번에는 서비스 스크립트와 데몬을 둘 다 `kill -9`하자 게이트웨이를 거치는
+  경로 53개가 남았으며, `tailscaled --cleanup`만으로 기록된 52개가 지워져 같은
+  테이블이 됨. 세 번째로 그렇게 `kill -9`한 뒤 데몬을 손으로 시작하니 데몬
+  자신의 시작이 기록된 경로 56개를 지웠고, `--exit-node=` 뒤의 테이블은 exit
+  node 없이 데몬이 돌던 때와 같았음
+- x86_64: `--exit-node=tokyo`에서 데몬을 `kill -9`: 서비스의 `--cleanup`이
+  기록된 호스트 경로 6개를 지웠고 라우팅 테이블이 서비스 시작 전과 같았음.
+  exit node를 쓰는 채로 다시 시작한 뒤 `--exit-node=`로 exit node 없는 데몬의
+  테이블이 됨
+- 둘 다: 서비스가 시작되고 MagicDNS 이름으로 `ping mac-mini`가 응답함. 데몬에
+  `kill -TERM`을 보내면 서비스 스크립트가 끝나고 `tun/0`이 내려가며 라우팅
+  테이블과 `resolv.conf`가 시작 전과 같음
+
+없어졌던 x86_64 데몬은 Haiku nightly hrev60450에서 revision 5로, 로그인한 TUN
+노드로 다시 찾아봤습니다. 데몬 로그와 syslog를 ssh로 따라가 VM 밖의 파일에
+담았고, 1분마다 팀 목록, 남은 메모리, `tailscale status`, MagicDNS 이름으로
+피어에 `ping`을 기록했습니다.
+
+- ssh에서 `nohup`으로 `tailscaled-service` 시작: 61분
+- 대화형 ssh 세션(pty, `nohup` 없음)에 `tailscaled-service &`를 입력한 뒤 ssh
+  클라이언트를 죽여 연결을 끊음: 61분. 세션의 셸은 사라지고 데몬은 남음
+- 끝나는 ssh 명령에서 `nohup`으로 `tailscaled` 자체를 시작하고 출력은 로그로:
+  60분
+- 이어서 그 데몬이 도는 채로 다른 revision의 패키지를 `pkgman install`: 데몬은
+  비활성화된 패키지에서 계속 돌았고, 12분 더 지켜봄
+
+모든 경우에 데몬은 같은 팀으로 남았고, ping은 모두 응답했으며, 시스템의 사용
+메모리는 340~356MB(pkgman이 도는 동안 잠깐 425MB)였고, 데몬 로그에도 syslog에도
+panic, fatal error, 시그널, debug_server의 흔적이 없었습니다. tailscaled는
+SIGINT와 SIGTERM만 처리하므로 `nohup` 없이 시작했다면 SIGHUP에 끝나겠지만, 이
+Haiku에서는 ssh 세션의 연결이 끊길 때 백그라운드 작업도 포그라운드의 Go
+프로그램(`tailscale debug watch-ipn`)도 SIGHUP을 받지 않았습니다(`kill -HUP`을
+보내면 그런 프로그램은 끝남). 그래서 재현되지 않았고 원인은 알 수 없습니다.
+서비스를 `nohup`이나 launch 작업으로 시작하면 SIGHUP 가능성은 없어집니다.
 
 확인하지 않은 내용입니다.
 
 - **TUN 모드에서**: 연결 중의 DHCP 갱신, 잠자기 후 깨어남, 서브넷 라우트
-  수락. x86_64에서의 네트워크 변화와 exit node
+  수락. x86_64에서의 네트워크 변화, 그리고 위 시험 이상의 x86_64 exit node
 - tailnet 위의 **IPv6**: Haiku 스택 수정이 필요하며 이 시험에는 포함하지 않음
 - 이 패키지로 서브넷 라우트나 exit node를 **제공**하는 것(관리자 승인이 필요함)
 

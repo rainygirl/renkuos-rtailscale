@@ -418,16 +418,66 @@ QEMU, installed from the file with `pkgman install`, service started with
   the launch job started the service (`launch_roster info` shows it
   running) and the node was back in the tailnet; it stayed up and reached
   the peer for the six minutes it was watched
-- x86_64, open: once, about ten minutes after the package was reinstalled
-  and the service started by hand from an ssh session, the daemon was found
-  gone; its log was lost (the machine was powered off) and it was not seen
-  again
+- x86_64: once, about ten minutes after the package was reinstalled and
+  the service started by hand from an ssh session, the daemon was found
+  gone; its log was lost (the machine was powered off). Not reproduced
+  since, see below
+
+Revision 6 on arm64 and revision 5 on x86_64 (the same machines as above,
+QEMU, installed from the file, signed in, TUN mode): the host routes of an
+exit node are recorded and removed after `kill -9`.
+
+- arm64: with `--exit-node=tokyo` (the public address is the exit node's,
+  `bypass-routes` lists the pinned host routes): `kill -9` of the daemon,
+  and the service's `--cleanup` removed all 13 host routes; the routing
+  table (`route list inet`, sorted, md5) was identical to the one before
+  the service first started. Started again, the exit node was in use again;
+  then `kill -9` of both the service script and the daemon left 53 routes
+  through the gateway, and `tailscaled --cleanup` alone removed the 52
+  recorded ones, giving the same table. A third time, the daemon was started
+  by hand after such a `kill -9`: its own start removed the 56 recorded
+  routes, and with `--exit-node=` the table was identical to the one with
+  the daemon running without an exit node
+- both: the service started, `ping mac-mini` by MagicDNS name answered;
+  `kill -TERM` of the daemon ended the service script, took `tun/0` down
+  and left the routing table and `resolv.conf` as before the start
+- x86_64: with `--exit-node=tokyo`, `kill -9` of the daemon: the service's
+  `--cleanup` removed the 6 recorded host routes and the routing table was
+  identical to the one before the service started; started again with the
+  exit node, `--exit-node=` gave the table of the daemon without one
+
+The x86_64 daemon that vanished was looked for again on Haiku nightly
+hrev60450 with revision 5, signed in as a TUN node, with the daemon's log
+followed over ssh into a file outside the VM, the syslog followed the same
+way, and every minute the team list, free memory, `tailscale status` and a
+`ping` of a peer by MagicDNS name:
+
+- started by `tailscaled-service` with `nohup` from ssh: 61 minutes
+- `tailscaled-service &` typed into an interactive ssh session (a pty,
+  no `nohup`), whose connection was then cut by killing the ssh client: 61
+  minutes; the session's shell went away, the daemon stayed
+- `tailscaled` itself with `nohup`, output into its log, from an ssh
+  command that then ended: 60 minutes
+- then, with that daemon running, another revision of the package
+  installed with `pkgman install`: the daemon kept running from the
+  deactivated package and was watched for 12 more minutes
+
+In each run the daemon stayed the same team, every ping was answered, the
+system's used memory stayed between 340 and 356 MB (425 MB for a moment
+while pkgman ran), and neither the daemon's log nor the syslog shows a
+panic, a fatal error, a signal or the debug_server. tailscaled handles only
+SIGINT and SIGTERM, so a SIGHUP would end it unless it was started with
+`nohup`; but on this Haiku neither a background job nor a foreground Go
+program of an ssh session (`tailscale debug watch-ipn`) got one when the
+session's connection was cut, while `kill -HUP` does end such a program.
+So the disappearance was not reproduced, and its cause is unknown. Starting
+the service with `nohup`, or through the launch job, rules the SIGHUP out.
 
 Not verified:
 
 - **in TUN mode**: a DHCP renewal while connected, a machine that sleeps
-  and wakes, accepting subnet routes; network changes and exit nodes on
-  x86_64
+  and wakes, accepting subnet routes; network changes on x86_64, and
+  there an exit node beyond the test above
 - **IPv6** over the tailnet: needs the Haiku stack fix, which is not part of
   these tests
 - **advertising** subnet routes or an exit node with these packages (it
